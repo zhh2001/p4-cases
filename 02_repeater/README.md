@@ -1,42 +1,65 @@
-# 🔁 中继器示例
+# 🔁 Case 02 · Port Repeater
 
-## 📘 项目简介
-本例展示了一个典型的“数据包中继器”的实现，旨在通过简单的端口映射逻辑，引导初学者理解条件语句与查找表在 P4 控制流程中的应用。该程序实现了一个双端口交换机：当数据包从端口 1 进入时将从端口 2 转发出去，反之亦然。
+> **学习目标**: 理解 P4 最简单的"端口映射"行为;体会"硬编码的 if-else"与"查找表"的差别。
 
-该示例是 P4 数据面编程的入门级案例之一，适用于教学、实验和基础研究环境中，帮助用户理解 P4 控制块逻辑、元数据处理及表驱动行为。
+## 功能
 
-## 🧱 项目结构
+两端口交换机,**P4 程序硬编码** 1↔2 互转:
 
-- `main.py`：定义了包含两个主机和一个 P4 交换机的拓扑结构，用于启动 Mininet 仿真环境。
-- `main.p4`：完整的 P4 程序，实现了基于入端口进行输出端口决定的逻辑，包含基于条件语句与查找表的两种方式。
-- `send.py`：数据发送脚本，用于向目标主机发送单个数据包。
-- `receive.py`：接收脚本，用于实时显示接收到的数据包内容。
+```
+h1  --port 1 -- s1 -- port 2--  h2
+           (ingress==1 → egress=2;ingress==2 → egress=1)
+```
 
-## 🚀 功能说明
+依然**无需下表**,控制器只推 pipeline。如果要改转发方向,必须重新编译 P4;这正是"硬编码控制面"的局限,下一案例 (03) 会展示用表替换掉这种硬编码。
 
-该交换机具备以下数据面处理能力：
+## 文件
 
-- 能够解析以太网帧并进入 `Ingress` 控制流程；
-- 根据入端口的值决定数据包的出端口，实现单向映射逻辑（1→2，2→1）；
-- 支持两种实现方式：
-  - **方式一**：使用条件判断（`if-else`）结构直接设置 `standard_metadata.egress_spec`；
-  - **方式二**：通过查找表匹配 `ingress_port`，并调用设置出端口的动作；
-- 可由控制器通过 P4Runtime 动态下发查找表项。
+| 文件 | 作用 |
+| --- | --- |
+| `main.p4` | 解析以太头 → `if-else` 选择 egress → 重封装 |
+| `topology.py` | Mininet 2 主机拓扑 |
+| `controller/main.go` | 推 pipeline → 睡到被 SIGTERM |
+| `test.py` | h1 发 / h2 收一帧验证 |
+| `run.sh` | 一键编译 + 启动 + 测试 |
 
-该逻辑模拟了传统硬件网络中简化的“信号中继器”功能，是理解端口转发与查表机制的关键起点。
+## P4 要点
 
-## 🧪 验证方式
+```p4
+apply {
+    if (standard_metadata.ingress_port == 1) {
+        standard_metadata.egress_spec = 2;
+    } else if (standard_metadata.ingress_port == 2) {
+        standard_metadata.egress_spec = 1;
+    } else {
+        mark_to_drop(standard_metadata);
+    }
+}
+```
 
-在拓扑启动后，主机之间的通信应满足以下行为：
-- 从 `h1` 发送的数据包应由交换机转发至 `h2`；
-- 从 `h2` 发送的数据包应由交换机转发至 `h1`；
-- 可使用 `send.py` 与 `receive.py` 进行测试；
-- 亦可使用 `ping`、`iperf` 等工具进一步验证通道连通性与传输性能。
+注意 **无 `table.apply()`**,**无 action**,一切都在 `apply{}` 的控制流里。
 
-示例运行后可观察到其中一台主机成功接收到另一台发出的自定义报文，验证中继器逻辑运行正确。
+## 运行
 
-📚 技术要点
-- 使用标准 `P4_16` 语法；
-- 演示 `standard_metadata.ingress_port` 与 `standard_metadata.egress_spec` 的基本应用；
-- 结合控制器进行查找表项的动态配置；
-- 为后续的多表匹配、条件路由等高级主题打下基础。
+```bash
+sudo ./run.sh          # 自动测试
+sudo ./run.sh cli      # 进入 mininet CLI
+```
+
+## 预期输出
+
+```
+    controller: pipeline installed via VERIFY_AND_COMMIT; repeater ready
+*** Starting sniffer on h2
+*** Sending test frame from h1
+    SEND: 00:00:00:00:00:01 -> 00:00:00:00:00:02 payload=b'hello-repeater'
+SUCCESS: received src=00:00:00:00:00:01 dst=00:00:00:00:00:02 payload=b'hello-repeater'
+```
+
+## 故障排查
+
+**h2 没收到包**:  
+→ `sudo mn -c` 清理残留,重跑。
+
+**`test.py` 脚本本身挂住**:  
+→ 检查 scapy 版本 ≥ 2.4.5(有 `AsyncSniffer`);`python3 -c "import scapy; print(scapy.__version__)"`。

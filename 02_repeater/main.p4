@@ -1,23 +1,20 @@
+/* -*- P4_16 -*- */
+/*
+ * Case 02: Port Repeater.
+ *
+ * A two-port pass-through:
+ *   packet arrives on port 1  ->  egress on port 2
+ *   packet arrives on port 2  ->  egress on port 1
+ *
+ * There are no match-action tables; ingress hard-codes the mapping with
+ * an if/else on standard_metadata.ingress_port. The controller only
+ * needs to push the pipeline.
+ */
+
 #include <core.p4>
 #include <v1model.p4>
 
-typedef bit<32> ipv4Addr_t;
 typedef bit<48> macAddr_t;
-
-header ipv4_t {
-    bit<4>     version;
-    bit<4>     internetHeaderLength;
-    bit<8>     diffserv;
-    bit<16>    totalLength;
-    bit<16>    identification;
-    bit<3>     flags;
-    bit<13>    fragmentOffset;
-    bit<8>     timeToLive;
-    bit<8>     protocol;
-    bit<16>    headerChecksum;
-    ipv4Addr_t srcAddr;
-    ipv4Addr_t dstAddr;
-}
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -29,37 +26,30 @@ struct metadata {}
 
 struct headers {
     ethernet_t ethernet;
-    ipv4_t     ipv4;
 }
 
 parser MyParser(packet_in packet,
                 out headers hdr,
                 inout metadata meta,
                 inout standard_metadata_t standard_metadata) {
-
     state start {
+        packet.extract(hdr.ethernet);
         transition accept;
     }
-
 }
+
+control MyVerifyChecksum(inout headers hdr, inout metadata meta) { apply {} }
 
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
-
-    table my_table {
-        actions = {
-            NoAction;
-        }
-    }
-
     apply {
-        my_table.apply();
         if (standard_metadata.ingress_port == 1) {
             standard_metadata.egress_spec = 2;
-        }
-        else if (standard_metadata.ingress_port == 2) {
+        } else if (standard_metadata.ingress_port == 2) {
             standard_metadata.egress_spec = 1;
+        } else {
+            mark_to_drop(standard_metadata);
         }
     }
 }
@@ -70,16 +60,12 @@ control MyEgress(inout headers hdr,
     apply {}
 }
 
+control MyComputeChecksum(inout headers hdr, inout metadata meta) { apply {} }
+
 control MyDeparser(packet_out packet, in headers hdr) {
-    apply {}
-}
-
-control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
-    apply {}
-}
-
-control MyComputeChecksum(inout headers hdr, inout metadata meta) {
-    apply {}
+    apply {
+        packet.emit(hdr.ethernet);
+    }
 }
 
 V1Switch(

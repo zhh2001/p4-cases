@@ -1,114 +1,143 @@
-# 带内网络遥测
+# 🛰️ Case 06 · 带内网络遥测(INT)
 
-## 示例简介
+> **学习目标**: 多交换机(3 台)转发 + **IPv4 Options** 承载的 INT 元数据。数据面在转发时**顺手注入自己的 swid / 队列深度 / 出端口**,控制面只负责"装好表,其他我不管"。
 
-本示例实现了一个基于 P4 编程语言的带内网络遥测（In-band Network Telemetry，简称 INT）系统，支持在数据包传输路径中嵌入逐跳遥测信息，实现对网络状态的实时监控。该示例利用 IPv4 Options 头部扩展字段，在不引入额外控制消息的前提下，将交换路径中每跳节点的遥测信息（包括交换机 ID、输出端口号和当前排队长度）封装进数据包，并由接收端解析提取。
+## 拓扑
 
-该示例的设计理念源自现代可编程数据面的遥测需求，适用于对网络性能、路径行为、瓶颈链路等实时分析的研究与教学场景。
-
-## 网络拓扑结构
-
-```text
-                   +--+
-                   |h4|
-                   +--+
-                    |
-                    |
-+--+      +--+     +--+     +--+
-|h1+------+s1+-----+s3+-----+h3|
-+--+      +--+     +--+     +--+
-            |
-            |
-          +--+
-          |s2|
-          +--+
-            |
-            |
-          +--+
-          |h2|
-          +--+
+```
+            h4
+             │
+             │
+h1 ── s1 ── s3 ── h3
+      │
+      s2
+      │
+      h2
 ```
 
-该拓扑构建了一个含四台主机（h1-h4）与三台交换机（s1-s3）的典型 INT 传输场景，其中 h1 向 h2 发送 UDP 流量，沿路径携带遥测信息并由 h2 接收解码。
+端口编号(与 `controller/main.go` 里的 `switchConfig` 一致):
 
-## 核心功能与设计
+| 交换机 | port 1 | port 2 | port 3 |
+| --- | --- | --- | --- |
+| s1 | h1  | s2   | s3   |
+| s2 | h2  | s1   | —    |
+| s3 | h3  | h4   | s1   |
 
-### 1. 遥测信息嵌入机制
+IP / MAC:
 
-本示例通过扩展 IPv4 Options 字段实现遥测数据的逐跳注入。每个交换机在转发数据包时，将本地状态信息编码为自定义 INT 头部，附加至 IPv4 Options 中，具体字段如下：
+| 主机 | IP | MAC |
+| --- | --- | --- |
+| h1 | 10.0.1.1 | 00:00:0a:00:01:01 |
+| h2 | 10.0.2.2 | 00:00:0a:00:02:02 |
+| h3 | 10.0.3.3 | 00:00:0a:00:03:03 |
+| h4 | 10.0.3.4 | 00:00:0a:00:03:04 |
 
-- `swid`：交换机标识符；
-- `qdepth`：当前 egress 端口队列长度（模拟值）；
-- `portid`：出口端口编号。
+## 功能
 
-### 2. 接收端解析功能
+- 每台交换机是**IPv4 LPM 路由器**:匹配目的 IP 前缀 → 重写 dst MAC + 设置 egress。
+- 若数据包**携带 INT IPv4 Option**(option number 31),egress pipeline **追加**一段 `SwitchTrace(swid, qdepth, portid)`。多跳之后接收端能看到完整路径。
+- h1 → h2 途中经过 s1 和 s2,接收方看到 INT 栈包含 2 条(s1 和 s2 的 swid)。
 
-接收端（h2）运行专用脚本 `receive.py`，可对嵌入 IPv4 Options 字段中的 INT 信息进行解码，打印逐跳遥测字段，便于观察链路性能状态。
+## 文件
 
-### 3. 可扩展性
+| 文件 | 作用 |
+| --- | --- |
+| `main.p4` | 完整 INT pipeline(带 ingress LPM 路由 + egress INT 注入 + IPv4 checksum 重算) |
+| `topology.py` | 3 交换机 4 主机拓扑,并行拉起 3 个 BMv2 实例(9559/9560/9561) |
+| `controller/main.go` | 单一 Go 程序,用 `-switch-id` 区分 s1/s2/s3,各自装不同的 LPM 表和 `int_table` 默认动作 |
+| `test_send.py` | h1 发一个预封装了空 INT option 的 UDP 包 |
+| `test_receive.py` | h2 捕获并解析 INT 栈,验证含 s1 + s2 |
+| `run.sh` | 编译 + 3 控制器并行 + 自动验证 |
 
-本示例可根据需要扩展遥测字段、增加跳数上限，或与流分类器结合，实现条件式遥测、可编程采样等高级功能。
+## P4 要点
 
-## 项目结构说明
+INT 头的"逐跳追加"靠 egress:
 
-```text
-.
-├── main.p4     # INT 功能的完整 P4 实现
-├── main.py     # 自定义拓扑与交换机配置脚本
-├── send.py     # h1 端发送测试数据包的脚本（包含预封装INT头）
-└── receive.py  # h2 端接收并解析 INT 数据包的脚本
+```p4
+action add_int_header(switch_id_t swid){
+    hdr.int_count.num_switches = hdr.int_count.num_switches + 1;
+    hdr.int_headers.push_front(1);
+    hdr.int_headers[0].setValid();
+    hdr.int_headers[0].switch_id  = (bit<13>)swid;
+    hdr.int_headers[0].queue_depth = (bit<13>)standard_metadata.deq_qdepth;
+    hdr.int_headers[0].output_port = (bit<6>) standard_metadata.egress_port;
+    hdr.ipv4.ihl = hdr.ipv4.ihl + 1;
+    hdr.ipv4.totalLen = hdr.ipv4.totalLen + 4;
+    hdr.ipv4_option.optionLength = hdr.ipv4_option.optionLength + 4;
+}
+
+table int_table {
+    actions = { add_int_header; NoAction; }
+    default_action = NoAction();       // 控制器把它改成 add_int_header(我的 swid)
+}
 ```
 
-## 测试方法
+## Go 控制器要点
 
-### 1. 启动接收端监听进程
+同一二进制,三份配置:
 
-进入 h2 主机，并运行接收脚本以捕获遥测包：
+```go
+func configFor(switchID uint64) switchConfig {
+    switch switchID {
+    case 1: return switchConfig{
+        deviceID: 1, switchID: 1,
+        lpm: []lpmEntry{
+            {"10.0.1.1", 32, "00:00:0a:00:01:01", 1},
+            {"10.0.2.2", 32, "00:01:0a:00:02:02", 2},
+            {"10.0.3.0", 24, "00:00:00:03:01:00", 3},
+        }}
+    case 2: ...
+    case 3: ...
+    }
+}
+```
+
+动态改**表默认动作**:
+
+```go
+defInt, _ := tableentry.NewBuilder(p, "MyEgress.int_table").
+    AsDefault().
+    Action("MyEgress.add_int_header",
+        tableentry.Param("swid", codec.MustEncodeUint(cfg.switchID, 13))).
+    Build()
+c.WriteTableEntry(ctx, client.UpdateModify, defInt)   // 注意是 MODIFY
+```
+
+(P4Runtime 约定:写默认动作用 `MODIFY`,不是 `INSERT`。)
+
+## 运行
 
 ```bash
-python receive.py
+sudo ./run.sh          # 自动 send/receive 测试
+sudo ./run.sh cli      # 进 mininet CLI 自己玩(h1 可以 ping h2)
 ```
 
-### 2. 发送携带 INT 头部的数据包
+## 预期输出
 
-进入 h1 主机，执行以下命令发送一条 UDP 报文至 h2，并预封装 INT 信息头部：
-
-```bash
-python send.py 10.0.2.2 "test" 1
+```
+    ctrl1: s1 ready
+    ctrl2: s2 ready
+    ctrl3: s3 ready
+*** Sending INT-carrying UDP packet h1 -> h2
+received: src=00:01:0a:00:02:02 dst=00:00:0a:00:02:02
+IP: 0.0.0.0 -> 10.0.2.2 ihl=8
+INT count=2
+  swid=2 qdepth=0 portid=1
+  swid=1 qdepth=0 portid=2
+SUCCESS: INT stack carries s1 and s2 traces
 ```
 
-### 3. 观察遥测数据输出
+INT 栈的顺序是**倒序**:`swid=2` 在前(最新 push,即 s2 egress),`swid=1` 在后(更早 push,s1 egress)。这是 `push_front` 造成的,符合规范。
 
-接收端将显示解析后的遥测信息，如：
+## 故障排查
 
-```text
-sniffing on h2-eth0
-got a packet
-###[ Ethernet ]### 
-  dst = 00:00:0a:00:02:02
-  src = 00:01:0a:00:02:02
-###[ IP ]### 
-  ihl     = 8
-  options = 
-    ###[ INT ]### 
-      count = 2
-      ###[ SwitchTrace ]### 
-        swid   = 2
-        qdepth = 0
-        portid = 1
-      ###[ SwitchTrace ]### 
-        swid   = 1
-        qdepth = 0
-        portid = 2
-```
+**INT 栈只有 1 条**:  
+某台交换机的 `int_table default_action` 没设成 `add_int_header`。检查控制器日志,确认 3 个 "int_table default = add_int_header(swid=N)" 都出现。
 
-### 4 中间交换机的作用说明
+**`SUCCESS` 失败并打出"no UDP packet received"**:  
+静态 ARP 或 LPM 某条配错了。按日志看哪一跳丢。用 `sudo ./run.sh cli` 进入 mininet,在 h1 上 `tcpdump -i h1-eth0`,在 h2 上也 tcpdump,对比看包停在哪一跳。
 
-- s1 与 s2 负责在数据包转发过程中，追加其本地的遥测条目。
+## 延伸
 
-## 技术要点与实现细节
-
-- **P4 INT 头定义**：通过 `header_type` 描述单条 `SwitchTrace` 字段，支持动态个数追加；
-- **Options IHL 更新**：IPv4 IHL 字段根据 INT 头部长度自动更新；
-- **INT 路径控制**：可通过匹配规则决定是否插入遥测信息，支持灵活策略配置；
-- **性能建议**：若应用于真实环境，可考虑结合 Digest、Mirror 或压缩机制减小开销。
+- 真实 INT 规范(INT-MD)要复杂得多——本案例是最简化的"教学 INT"。想做生产级可以参考 `p4lang/p4app-int` 或 `hyperxpro/in-band-network-telemetry`。
+- 本案例**不统计 qdepth / latency**;仅记录 swid + port。加上时间戳字段就是一个完整的 P-Telemetry 基座。

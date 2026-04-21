@@ -75,3 +75,18 @@ cython_debug/
 *.p4cfg
 *.json
 *.pcap
+*.p4info.txt
+/*/build/
+build/
+
+# Go
+go.sum
+/*/bin/
+# root-level compiled binary named 'controller' (not cmd source dirs)
+/controller
+
+# Mininet leftovers
+*.log.stderr
+
+# topology runtime files
+topology.json

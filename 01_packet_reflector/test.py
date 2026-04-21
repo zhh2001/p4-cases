@@ -1,101 +1,59 @@
-import socket
+#!/usr/bin/env python3
+"""Packet reflector verification.
+
+Runs inside h1. Sends a raw Ethernet frame with a well-known payload and
+waits for the switch to reflect the frame back with src/dst MACs swapped.
+Prints SUCCESS and exits 0 on success, FAILURE and exits 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import sys
 import time
-from threading import Event
-from threading import Thread
 
-from scapy.arch import get_if_hwaddr
-from scapy.config import conf
-from scapy.data import ETH_P_ALL
-from scapy.interfaces import get_if_list
-from scapy.layers.inet import IP
-from scapy.layers.l2 import Ether
-from scapy.sendrecv import sendp
-from scapy.sendrecv import sniff
+from scapy.all import AsyncSniffer, Ether, get_if_hwaddr, sendp
+
+IFACE = "h1-eth0"
+TEST_MAC = "02:aa:bb:cc:dd:ee"
+PAYLOAD = b"hello-reflector"
+TIMEOUT = 3.0
 
 
-class Sniffer(Thread):
-    def __init__(self, interface="eth0"):
-        super().__init__()
+def main() -> int:
+    my_mac = get_if_hwaddr(IFACE)
 
-        self.interface = interface
-        self.my_mac = get_if_hwaddr(interface)
-        self.daemon = True
-        self.socket = None
-        self.stop_sniffer = Event()
+    sniffer = AsyncSniffer(
+        iface=IFACE,
+        count=1,
+        timeout=TIMEOUT,
+        lfilter=lambda p: Ether in p and p[Ether].dst == my_mac and p[Ether].src == TEST_MAC,
+    )
+    sniffer.start()
+    # Let the sniffer bind its raw socket before we send.
+    time.sleep(0.5)
 
-    def isNotOutgoing(self, pkt) -> bool:
-        return pkt[Ether].src != self.my_mac
+    frame = Ether(src=my_mac, dst=TEST_MAC) / PAYLOAD
+    sendp(frame, iface=IFACE, verbose=False)
 
-    def run(self) -> None:
-        self.socket = conf.L2listen(
-            type=ETH_P_ALL,
-            iface=self.interface,
-            filter="ip",
-        )
-        sniff(
-            lfilter=self.isNotOutgoing,
-            opened_socket=self.socket,
-            prn=self.print_packet,
-            stop_filter=self.should_stop_sniffer,
-        )
+    sniffer.join(timeout=TIMEOUT + 0.5)
+    pkts = sniffer.results or []
 
-    def join(self, timeout=None) -> None:
-        self.stop_sniffer.set()
-        super().join(timeout)
+    if not pkts:
+        print(f"FAILURE: no reflected packet seen within {TIMEOUT}s")
+        return 1
 
-    def should_stop_sniffer(self, _) -> bool:
-        return self.stop_sniffer.is_set()
+    reflected = pkts[0]
+    if reflected[Ether].src != TEST_MAC or reflected[Ether].dst != my_mac:
+        print(f"FAILURE: MAC not swapped (got src={reflected[Ether].src} dst={reflected[Ether].dst})")
+        return 1
+    if bytes(reflected[Ether].payload) != PAYLOAD:
+        print(f"FAILURE: payload corrupted (got {bytes(reflected[Ether].payload)!r})")
+        return 1
 
-    @classmethod
-    def print_packet(cls, pkt) -> None:
-        print("[!] 数据包被交换机反射回来了: ")
-        pkt.show()
-        ether_layer = pkt.getlayer(Ether)
-        print(f"[!] INFO: {ether_layer.src} -> {ether_layer.dst}\n")
+    print(f"SUCCESS: packet reflected with MACs swapped "
+          f"(src={reflected[Ether].src} dst={reflected[Ether].dst})")
+    return 0
 
 
-def get_if() -> str:
-    iface = None  # "h1-eth0"
-    for i in get_if_list():
-        if "eth0" in i:
-            iface = i
-            break
-    if iface is None:
-        exit("eth0 interface not found")
-    return iface
-
-
-def send_packet(iface, addr) -> None:
-    payload = input("请输入数据包要携带的信息：")
-    print(f"Sending on interface {iface} to {addr}\n")
-    pkt = Ether(src=get_if_hwaddr(iface), dst='00:01:02:03:04:05')
-    pkt = pkt / IP(dst=addr) / payload
-    sendp(pkt, iface=iface, verbose=False)
-
-
-def main():
-    addr = "10.0.0.2"
-    addr = socket.gethostbyname(addr)
-    iface = get_if()
-
-    listener = Sniffer(iface)
-    listener.start()
-
-    try:
-        while True:
-            time.sleep(0.75)
-            send_packet(iface, addr)
-
-    except KeyboardInterrupt:
-        print("[*] Stop sniffing")
-        listener.join(2.0)
-
-        if listener.is_alive():
-            listener.socket.close()
-
-    except Exception as ex:
-        print(ex)
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

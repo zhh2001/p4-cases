@@ -1,45 +1,72 @@
-# 🧭 二层转发交换机示例
+# 🧭 Case 03 · 静态 L2 转发交换机
 
-## 📘 示例简介
+> **学习目标**: 从"硬编码 if-else"(Case 02)升级到"**表驱动**"——用 exact 匹配的 `dmac` 表把目的 MAC → 出端口。这是 match-action 编程范式的第一课。
 
-本示例展示了一个静态配置的二层转发交换机在 P4 数据面语言中的实现。该示例通过静态地将目标 MAC 地址映射到出端口，实现基于以太网帧的基本转发逻辑，是理解
-P4 查找表结构和报文匹配-动作编程范式的重要入门案例。
+## 拓扑
 
-与真实网络设备中使用的 L2 学习算法不同，本示例采用静态表项方式，帮助用户聚焦于表结构设计、元数据处理、匹配字段选择等关键概念。
+星型:1 交换机,4 主机(h1..h4)。每个主机 IP `10.0.0.N`,MAC `00:00:00:00:00:0N`,连在 s1 的 port N 上。
 
-## 🧱 示例结构
+## 功能
 
-- `main.py`：定义网络拓扑结构，包括一个交换机和四个主机。
-- `main.p4`：实现 L2 转发逻辑的 P4 程序。
-- `controller.py`：提供基于 P4Runtime 的动态控制平面接口。
+- 控制器向 `dmac` 表写入 4 条:`MAC → 出端口 N`。
+- 因为 P4 **只做 exact 单播**,ARP 广播不会被表匹配,所以 `topology.py` 预先给每台主机灌了静态 ARP 表。
+- `pingAll` 应 100% 通。
 
-## 🔧 示例功能说明
+## 文件
 
-该交换机具备如下功能：
+| 文件 | 作用 |
+| --- | --- |
+| `main.p4` | `dmac` exact 表,命中调用 `forward(port)` |
+| `topology.py` | 4 主机拓扑 + 静态 ARP 注入 |
+| `controller/main.go` | 推 pipeline + 写 4 条 dmac 表项 |
+| `run.sh` | 一键编译 + 启动 + `pingAll` |
 
-- 解析以太网帧头并进入 `Ingress` 控制流程；
-- 匹配以太网帧的目标 MAC 地址，通过查找表决定应使用的出端口；
-- 使用 `standard_metadata.egress_spec` 设置出端口；
-- 网络结构采用星型拓扑，主机通过一个中心交换机互连。
+## P4 要点
 
-查找表的设计允许根据 MAC 地址灵活地扩展转发行为，也为后续的动态学习机制奠定基础。
+```p4
+table dmac {
+    key     = { hdr.ethernet.dstAddr: exact; }
+    actions = { forward; NoAction; }
+    size    = 256;
+    default_action = NoAction;
+}
+```
 
-## 🧪 示例行为验证
+## Go 控制器要点
 
-在当前拓扑配置下，端口与主机的映射关系如下：
+```go
+for n := 1; n <= 4; n++ {
+    mac := fmt.Sprintf("00:00:00:00:00:%02d", n)
+    entry, _ := tableentry.NewBuilder(p, "MyIngress.dmac").
+        Match("hdr.ethernet.dstAddr", tableentry.Exact(codec.MustMAC(mac))).
+        Action("MyIngress.forward",
+            tableentry.Param("egress_port", codec.MustEncodeUint(uint64(n), 9))).
+        Build()
+    c.WriteTableEntry(ctx, client.UpdateInsert, entry)
+}
+```
 
-| 主机 | MAC 地址              | IP 地址      | 对应端口 |
-|----|---------------------|------------|------|
-| h1 | `00:00:0a:00:01:01` | `10.0.1.1` | 1    |
-| h2 | `00:00:0a:00:01:02` | `10.0.1.2` | 2    |
-| h3 | `00:00:0a:00:01:03` | `10.0.1.3` | 3    |
-| h4 | `00:00:0a:00:01:04` | `10.0.1.4` | 4    |
+注意**名字全是 P4 编译器给出的"全限定名"**:表 `MyIngress.dmac`,action `MyIngress.forward`,字段 `hdr.ethernet.dstAddr`。用 `p4c --p4runtime-files` 产出的 `main.p4info.txt` 自检。
 
-基于此配置构建的转发表可实现所有主机间的双向通信。在运行环境启动后，通过 `pingall` 命令应能观察到完整的点对点连通性验证结果。
+## 运行
 
-## 📚 技术要点
+```bash
+sudo ./run.sh          # pingAll,期待 0% 丢包
+sudo ./run.sh cli      # 进入 mininet CLI
+```
 
-- 使用 `P4_16` 标准语法；
-- 实现了以太网帧解析、查找表配置、动作执行与 `deparser` 输出；
-- 演示了如何在 `.p4` 文件中声明和应用基于 MAC 地址的匹配-动作表；
-- 为后续 L2 学习算法、动态表项更新等进阶特性打下基础。
+## 预期输出
+
+```
+    controller: dmac 00:00:00:00:00:01 -> port 1 installed
+    controller: dmac 00:00:00:00:00:02 -> port 2 installed
+    controller: dmac 00:00:00:00:00:03 -> port 3 installed
+    controller: dmac 00:00:00:00:00:04 -> port 4 installed
+*** Results: 0% dropped (12/12 received)
+SUCCESS: full mesh reachable via dmac table
+```
+
+## 延伸
+
+- **不灌静态 ARP 也能 ping 通**:需要广播机制,交给 Case 04。
+- **MAC 学习而非手工**:交给 Case 05。
