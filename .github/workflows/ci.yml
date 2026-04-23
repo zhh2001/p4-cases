@@ -3,16 +3,13 @@ name: ci
 # p4-cases CI: compile every case's P4 source and build every case's
 # Go controller. Live mininet / BMv2 tests require root + kernel
 # namespaces + Docker-style privileges that github-hosted runners do
-# not grant by default, so they are NOT run here — they are covered by
-# `sudo ./run.sh` locally on any Ubuntu 24.04+ machine.
+# not grant by default, so they are NOT run here — they are covered
+# by `sudo ./run.sh` locally on any Ubuntu 24.04+ machine.
 #
 # What CI catches:
-#   * P4 source compile errors (new case broken, or existing case
-#     regressed by a shared header change).
-#   * Go controller source compile errors (SDK upgrade broke an API
-#     we use, a controller imports something missing, etc.).
-#   * go mod tidy drift.
-#   * Shell-script lint on run.sh / run_helpers.sh.
+#   * P4 source compile errors.
+#   * Go controller source compile errors / tidy drift.
+#   * run.sh / run_helpers.sh lint regressions.
 
 on:
   push:
@@ -24,59 +21,57 @@ permissions:
   contents: read
 
 env:
-  P4C_IMAGE: "p4lang/p4c:latest"
   CASES: "01_packet_reflector 02_repeater 03_l2_forwarding_switch 04_l2_broadcast_switch 05_l2_learning_switch 06_int 07_meter 08_counter 09_ecmp_hash 10_firewall_acl 11_vxlan_encap 12_register_flow_counter 13_clone_to_cpu"
 
 jobs:
   p4-compile:
-    name: compile P4 (${{ matrix.case }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        case:
-          - 01_packet_reflector
-          - 02_repeater
-          - 03_l2_forwarding_switch
-          - 04_l2_broadcast_switch
-          - 05_l2_learning_switch   # compiles main_digest.p4
-          - 06_int
-          - 07_meter                # compiles indirect_meter.p4
-          - 08_counter              # compiles indirect_counter.p4
-          - 09_ecmp_hash
-          - 10_firewall_acl
-          - 11_vxlan_encap
-          - 12_register_flow_counter
-          - 13_clone_to_cpu
-    container: p4lang/p4c:latest
+    name: compile all P4 sources
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: locate P4 source
-        id: src
+
+      # Install p4c from the p4lang OBS repo. More reliable than the
+      # p4lang/p4c Docker image which has been shipping missing boost
+      # libraries, and faster than building from source.
+      - name: install p4c (p4lang OBS)
         shell: bash
         run: |
-          case_dir="${{ matrix.case }}"
-          if   [[ -f "$case_dir/main.p4" ]]; then src="$case_dir/main.p4"
-          elif [[ -f "$case_dir/main_digest.p4" ]]; then src="$case_dir/main_digest.p4"
-          elif [[ -f "$case_dir/indirect_meter.p4" ]]; then src="$case_dir/indirect_meter.p4"
-          elif [[ -f "$case_dir/indirect_counter.p4" ]]; then src="$case_dir/indirect_counter.p4"
-          else
-            echo "::error::no P4 source for $case_dir"; exit 1
-          fi
-          echo "src=$src" >> "$GITHUB_OUTPUT"
-          echo "Will compile $src"
-      - name: p4c
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg
+          curl -fsSL "https://download.opensuse.org/repositories/home:/p4lang/xUbuntu_22.04/Release.key" \
+              | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_p4lang.gpg >/dev/null
+          echo 'deb http://download.opensuse.org/repositories/home:/p4lang/xUbuntu_22.04/ /' \
+              | sudo tee /etc/apt/sources.list.d/home-p4lang.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y p4lang-p4c
+          p4c --version
+
+      - name: compile every P4 source
         shell: bash
         run: |
-          mkdir -p build
-          p4c -b bmv2 --target bmv2 --arch v1model --std p4-16 \
-              --p4runtime-files build/${{ matrix.case }}.p4info.txt \
-              -o build \
-              ${{ steps.src.outputs.src }}
-      - name: upload artifacts
+          set -euo pipefail
+          for case_dir in ${{ env.CASES }}; do
+            if   [[ -f "$case_dir/main.p4" ]]; then src="$case_dir/main.p4"
+            elif [[ -f "$case_dir/main_digest.p4" ]]; then src="$case_dir/main_digest.p4"
+            elif [[ -f "$case_dir/indirect_meter.p4" ]]; then src="$case_dir/indirect_meter.p4"
+            elif [[ -f "$case_dir/indirect_counter.p4" ]]; then src="$case_dir/indirect_counter.p4"
+            else echo "::error::no P4 source in $case_dir"; exit 1; fi
+
+            echo "::group::$case_dir ($(basename "$src"))"
+            mkdir -p "build/$case_dir"
+            p4c -b bmv2 --target bmv2 --arch v1model --std p4-16 \
+                --p4runtime-files "build/$case_dir/p4info.txt" \
+                -o "build/$case_dir" \
+                "$src"
+            echo "::endgroup::"
+          done
+          echo "All P4 sources compiled."
+
+      - name: upload P4 artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: p4-${{ matrix.case }}
+          name: p4-artifacts
           path: build/
           retention-days: 7
 

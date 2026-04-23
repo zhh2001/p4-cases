@@ -84,6 +84,9 @@ go.sum
 /*/bin/
 # root-level compiled binary named 'controller' (not cmd source dirs)
 /controller
+# Optional local workspace pointing at a sibling SDK checkout
+go.work
+go.work.sum
 
 # Mininet leftovers
 *.log.stderr
