@@ -26,6 +26,11 @@
 | [06](06_int/) | 带内网络遥测 | **多交换机 + IPv4 Options + 逐跳遥测** | 并行 3 个控制器,各装 LPM + `int_table` 默认动作 |
 | [07](07_meter/) | Meter | **Meter extern / 三色标记** | `MeterEntry` 配 CIR/PIR,drop 非绿流量 |
 | [08](08_counter/) | Counter | **Counter extern / 读取累积值** | `CounterEntry` 读出包数 / 字节数 |
+| [09](09_ecmp_hash/) | ECMP 多路径 | **5-tuple hash + ecmp group** | direct /32 + /24 ECMP + `ecmp_nhop` 2 个成员 |
+| [10](10_firewall_acl/) | 防火墙 ACL | **TERNARY 表 + priority** | 3 条不同优先级的 allow/deny 规则 |
+| [11](11_vxlan_encap/) | VXLAN 封装 | **头部插入 / `setValid()`** | 一条 vtep 表,外层头全参数化 |
+| [12](12_register_flow_counter/) | Register 逐流统计 | **register + hash(5-tuple)** | 纯数据面维护;控制器通过 Thrift 读回 |
+| [13](13_clone_to_cpu/) | 克隆到 CPU | **CloneSession + PacketIn** | 每包 clone 到 CPU port,控制器 `OnPacketIn` 收包 |
 
 ---
 
@@ -103,6 +108,11 @@ p4-cases/
 | 06 | h2 的 INT 栈包含 `swid ∈ {1,2}` 至少 2 条 |
 | 07 | metered 源的通过率 明显 < 非 metered 源 |
 | 08 | port 1 counter 增量 ≥ 我们注入的包数 |
+| 09 | h2 和 h3 均收到 >0 的 ECMP 分发流量 |
+| 10 | 4 条流的 allow/deny 结果与规则优先级一致 |
+| 11 | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对 |
+| 12 | Thrift 读出 register 某 slot = 注入包数 |
+| 13 | 控制器 `OnPacketIn` 收到的 clone 数 ≥ 注入包数 |
 
 不想跑测试、只想进 mininet CLI 手动玩:`sudo ./run.sh cli`。
 
@@ -125,15 +135,16 @@ Case 02+ 的测试依赖 `AsyncSniffer`(scapy ≥ 2.4.5)。`sudo pip3 install --
 
 ## 🗺️ 路线图
 
-本仓库案例覆盖了 P4 入门最常见的数据面+控制面模式。仍待补:
+本仓库已实现 13 个案例,覆盖 P4 入门到进阶的常见模式。后续候选:
 
-- [ ] Case 09: **ECMP hash** (多路径选择)
-- [ ] Case 10: **Firewall ACL** (TERNARY + priority)
-- [ ] Case 11: **VXLAN encap** (头部添加 / 删除)
-- [ ] Case 12: **Register-based flow counter** (用 P4 register 代替 counter extern)
-- [ ] Case 13: **Clone to CPU** (`pre.CloneSession` 演示,搭配一个自定义 CPU header)
+- [ ] **IPv6 lookup** (ipv6_lpm,超长 IP 前缀匹配)
+- [ ] **Stateful firewall** (register 维护 TCP 会话状态)
+- [ ] **NAT / SNAT** (五元组改写 + session 表)
+- [ ] **MPLS label swap / pop**
+- [ ] **Watchdog / liveness** (register 超时阈值 + 控制器周期读取 + 黑名单注入)
+- [ ] **INT-MD 完整版** (时间戳 + 路径染色)
 
-欢迎 PR 添加新案例。每个新案例的目录结构请参考已有的 7 个。
+欢迎 PR 添加新案例。每个新案例的目录结构请参考 13 个现有案例。
 
 ## 🤝 协作
 
