@@ -2,10 +2,12 @@ module github.com/zhh2001/p4-cases
 
 go 1.25.0
 
-require github.com/zhh2001/p4runtime-go-controller v1.1.0
+require (
+	github.com/p4lang/p4runtime v1.5.0
+	github.com/zhh2001/p4runtime-go-controller v1.1.0
+)
 
 require (
-	github.com/p4lang/p4runtime v1.5.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.33.0 // indirect

@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a case that fails, a regression, or a documentation error.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for taking the time to file a report. The fastest path to a
+        fix is a reproducer — please include the exact case, the command
+        you ran, and the full output up to the FAILURE / error message.
+  - type: input
+    id: case
+    attributes:
+      label: Case
+      placeholder: "e.g. 06_int, 12_register_flow_counter, or common/"
+    validations:
+      required: true
+  - type: textarea
+    id: cmd
+    attributes:
+      label: Command
+      description: The exact shell command, including `sudo ./run.sh` and any flags.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Tail of `sudo ./run.sh` output, from "*** Starting BMv2 ..." to the FAILURE line.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "e.g. Ubuntu 24.04, mininet 2.3.0, BMv2 commit, Go 1.25.5"
+    validations:
+      required: true

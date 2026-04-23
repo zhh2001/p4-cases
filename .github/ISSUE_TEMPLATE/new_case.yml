@@ -1,0 +1,34 @@
+name: New case proposal
+description: Propose a new P4 case to add to this repo.
+labels: [enhancement, new-case]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Before submitting, please skim the roadmap in the top-level README
+        to avoid duplicating a planned case.
+  - type: input
+    id: name
+    attributes:
+      label: Case name
+      placeholder: "e.g. NAT44, MPLS pop/push, ICMP responder"
+    validations:
+      required: true
+  - type: textarea
+    id: teaches
+    attributes:
+      label: What P4 concept does it teach?
+      description: A paragraph explaining the learning goal.
+    validations:
+      required: true
+  - type: textarea
+    id: sketch
+    attributes:
+      label: Data plane sketch
+      description: Rough pipeline (parser states, tables, externs).
+      render: p4
+  - type: textarea
+    id: verify
+    attributes:
+      label: How would the automated test verify it?
+      description: scapy probe, counter read, pingAll, ...
