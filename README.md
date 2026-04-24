@@ -1,5 +1,9 @@
 # 🧾 P4 Cases
 
+[![ci](https://github.com/zhh2001/p4-cases/actions/workflows/ci.yml/badge.svg)](https://github.com/zhh2001/p4-cases/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/zhh2001/p4runtime-go-controller.svg)](https://pkg.go.dev/github.com/zhh2001/p4runtime-go-controller)
+
 一组 **P4_16 + P4Runtime + Mininet** 的可运行教学案例，每个案例都配有：
 
 - 📝 `main.p4` 数据面源码
@@ -49,15 +53,16 @@
 ## 🚀 快速开始
 
 ```bash
-# 克隆两个仓库到同一目录(本仓库 go.mod 用 replace 指向本地 SDK,方便同步开发)
+# 只需克隆本仓库——SDK 由 go.mod 自动从 proxy.golang.org 拉取
 git clone git@github.com:zhh2001/p4-cases.git
-git clone git@github.com:zhh2001/p4runtime-go-controller.git
 cd p4-cases
 
 # 跑第一个案例
 cd 01_packet_reflector
 sudo ./run.sh
 ```
+
+> 想同步改 SDK?在仓库根目录放一个 `go.work` 指向本地 `p4runtime-go-controller` 即可,`go.work` / `go.work.sum` 已在 `.gitignore` 中,不会污染仓库。
 
 看到 `SUCCESS: packet reflected with MACs swapped` 就说明从 P4 编译到 Go 控制面再到 scapy 验证整条链路都正常了。
 
