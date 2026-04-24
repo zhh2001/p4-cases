@@ -80,7 +80,8 @@ cython_debug/
 build/
 
 # Go
-go.sum
+# go.sum IS committed — this is a binary repo and go.sum is required
+# for reproducible 'go build' after a fresh clone.
 /*/bin/
 # root-level compiled binary named 'controller' (not cmd source dirs)
 /controller
