@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 env:
-  CASES: "01_packet_reflector 02_repeater 03_l2_forwarding_switch 04_l2_broadcast_switch 05_l2_learning_switch 06_int 07_meter 08_counter 09_ecmp_hash 10_firewall_acl 11_vxlan_encap 12_register_flow_counter 13_clone_to_cpu"
+  CASES: "01_packet_reflector 02_repeater 03_l2_forwarding_switch 04_l2_broadcast_switch 05_l2_learning_switch 06_int 07_meter 08_counter 09_ecmp_hash 10_firewall_acl 11_vxlan_encap 12_register_flow_counter 13_clone_to_cpu 14_ipv6_lpm"
 
 jobs:
   p4-compile:

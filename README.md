@@ -35,6 +35,7 @@
 | [11](11_vxlan_encap/) | VXLAN 封装 | **头部插入 / `setValid()`** | 一条 vtep 表,外层头全参数化 |
 | [12](12_register_flow_counter/) | Register 逐流统计 | **register + hash(5-tuple)** | 纯数据面维护;控制器通过 Thrift 读回 |
 | [13](13_clone_to_cpu/) | 克隆到 CPU | **CloneSession + PacketIn** | 每包 clone 到 CPU port,控制器 `OnPacketIn` 收包 |
+| [14](14_ipv6_lpm/) | IPv6 LPM 路由 | **128 位 LPM + L3 重写 + hopLimit** | 4 条路由(/64×3 + /128×1),演示长前缀优先 |
 
 ---
 
@@ -118,6 +119,7 @@ p4-cases/
 | 11 | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对 |
 | 12 | Thrift 读出 register 某 slot = 注入包数 |
 | 13 | 控制器 `OnPacketIn` 收到的 clone 数 ≥ 注入包数 |
+| 14 | 4 条 IPv6 流：`/64` 命中、`/128` 长前缀覆盖、回退到 `/64`、无路由的流被 drop;同时校验 `hopLimit-1` 和 dst-MAC 重写 |
 
 不想跑测试、只想进 mininet CLI 手动玩:`sudo ./run.sh cli`。
 
@@ -140,9 +142,8 @@ Case 02+ 的测试依赖 `AsyncSniffer`(scapy ≥ 2.4.5)。`sudo pip3 install --
 
 ## 🗺️ 路线图
 
-本仓库已实现 13 个案例,覆盖 P4 入门到进阶的常见模式。后续候选:
+本仓库已实现 14 个案例,覆盖 P4 入门到进阶的常见模式。后续候选:
 
-- [ ] **IPv6 lookup** (ipv6_lpm,超长 IP 前缀匹配)
 - [ ] **Stateful firewall** (register 维护 TCP 会话状态)
 - [ ] **NAT / SNAT** (五元组改写 + session 表)
 - [ ] **MPLS label swap / pop**
