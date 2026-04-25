@@ -28,7 +28,7 @@ jobs:
     name: compile all P4 sources
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Install p4c from the p4lang OBS repo. More reliable than the
       # p4lang/p4c Docker image which has been shipping missing boost
@@ -69,7 +69,7 @@ jobs:
           echo "All P4 sources compiled."
 
       - name: upload P4 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: p4-artifacts
           path: build/
@@ -79,8 +79,8 @@ jobs:
     name: go build controllers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: "stable"
           cache: true
@@ -108,7 +108,7 @@ jobs:
     name: shellcheck run.sh
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck

@@ -7,7 +7,7 @@
 一组 **P4_16 + P4Runtime + Mininet** 的可运行教学案例，每个案例都配有：
 
 - 📝 `main.p4` 数据面源码
-- 🐍 `topology.py` 纯 Mininet 拓扑(**不依赖 p4utils / p4app**)
+- 🐍 `topology.py` 纯 Mininet 拓扑
 - 🐹 `controller/main.go` 用 [`p4runtime-go-controller`](https://github.com/zhh2001/p4runtime-go-controller) 写的控制面
 - ✅ `run.sh` 一键编译 + 启动 + 自动化验证 + 资源清理
 - 📖 中文 README,逐条讲 P4 结构、控制器代码、期望行为、故障排查
