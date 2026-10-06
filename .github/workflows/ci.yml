@@ -76,7 +76,7 @@ jobs:
 
   go-build:
     name: go build controllers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -107,19 +107,19 @@ jobs:
 
   python-runtime:
     name: Python runtime tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - name: install Mininet
         run: sudo apt-get update && sudo apt-get install -y mininet
       - name: check Python syntax
-        run: /usr/bin/python3 -m compileall -q common tests */*.py
+        run: /usr/bin/python3 -m compileall -q common tests ./*/*.py
       - name: run runtime tests
         run: /usr/bin/python3 -m unittest discover -s tests -v
 
   shellcheck:
     name: shellcheck run.sh
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - name: install shellcheck
