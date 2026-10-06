@@ -11,19 +11,18 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
-from mininet.net import Mininet
 from mininet.topo import Topo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 class MeterTopo(Topo):
@@ -35,29 +34,25 @@ class MeterTopo(Topo):
         self.addLink(h2, sw)
 
 
-def run_controller(controller_bin: str, p4info: str, config: str) -> subprocess.Popen:
+def run_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
+) -> Controller:
     info("*** Launching Go controller\n")
-    return subprocess.Popen(
-        [controller_bin, "-addr", "127.0.0.1:9559", "-p4info", p4info, "-config", config],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+    return runtime.start_controller(
+        [
+            controller_bin,
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+        ],
     )
 
 
-def wait_controller_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        decoded = line.decode(errors="replace").rstrip()
-        info(f"    controller: {decoded}\n")
-        if "meter-switch ready" in decoded:
-            return True
-    return False
+def wait_controller_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("meter-switch ready", timeout)
 
 
 def main() -> None:
@@ -69,27 +64,27 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=MeterTopo(), controller=None)
-    net.start()
+    with NetworkRuntime(MeterTopo()) as runtime:
+        net = runtime.net
 
-    ctrl = run_controller(args.controller, args.p4info, args.config)
-    if not wait_controller_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        if ctrl.stdout:
-            print(ctrl.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        ctrl = run_controller(runtime, args.controller, args.p4info, args.config)
+        if not wait_controller_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             h1 = net.get("h1")
             h2 = net.get("h2")
 
-            info("*** Phase 1: send 30 packets from non-metered src (expect ~30 on h2)\n")
+            info(
+                "*** Phase 1: send 30 packets from non-metered src (expect ~30 on h2)\n"
+            )
             unmetered = run_burst(h1, h2, src_mac="bb:bb:bb:bb:bb:bb", n=30, gap=0.01)
 
-            info("*** Phase 2: send 30 packets from metered src (expect partial drop)\n")
+            info(
+                "*** Phase 2: send 30 packets from metered src (expect partial drop)\n"
+            )
             metered = run_burst(h1, h2, src_mac="aa:aa:aa:aa:aa:aa", n=30, gap=0.005)
 
             print(f"Unmetered received: {unmetered}/30")
@@ -102,15 +97,6 @@ def main() -> None:
                 rc = 1
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 
@@ -121,7 +107,8 @@ def run_burst(sender, receiver, src_mac: str, n: int, gap: float) -> int:
     # Start sniffer on receiver in background.
     sniff_proc = receiver.popen(
         [
-            "python3", "-c",
+            "python3",
+            "-c",
             (
                 "import sys; from scapy.all import AsyncSniffer, Ether; "
                 f"s = AsyncSniffer(iface='{receiver.defaultIntf().name}', count={n}, timeout=4, "
@@ -136,10 +123,10 @@ def run_burst(sender, receiver, src_mac: str, n: int, gap: float) -> int:
 
     # Blast packets from sender.
     sender.cmd(
-        "python3 -c \""
+        'python3 -c "'
         "from scapy.all import Ether, sendp; import time; "
         f"[ (sendp(Ether(src='{src_mac}',dst='00:00:00:00:00:02')/b'x'*64, iface='{sender.defaultIntf().name}', verbose=False), "
-        f"time.sleep({gap})) for _ in range({n}) ]\""
+        f'time.sleep({gap})) for _ in range({n}) ]"'
     )
 
     try:

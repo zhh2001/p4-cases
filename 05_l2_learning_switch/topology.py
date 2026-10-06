@@ -10,19 +10,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
-import subprocess
 import sys
-import time
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
-from mininet.net import Mininet
 from mininet.topo import Topo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 def host_ip(n: int) -> str:
@@ -41,49 +38,33 @@ class LearningTopo(Topo):
             self.addLink(f"h{i}", sw)
 
 
-def run_controller(controller_bin: str, p4info: str, config: str, ports: int) -> subprocess.Popen:
+def run_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str, ports: int
+) -> Controller:
     info("*** Launching Go controller (digest learner)\n")
-    return subprocess.Popen(
+    return runtime.start_controller(
         [
             controller_bin,
-            "-addr", "127.0.0.1:9559",
-            "-p4info", p4info,
-            "-config", config,
-            "-ports", str(ports),
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+            "-ports",
+            str(ports),
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
     )
 
 
-def wait_controller_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        decoded = line.decode(errors="replace").rstrip()
-        info(f"    controller: {decoded}\n")
-        if "learning-switch ready" in decoded:
-            return True
-    return False
+def wait_controller_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("learning-switch ready", timeout)
 
 
-def drain_controller(proc: subprocess.Popen, seconds: float) -> None:
-    """Print whatever the controller emits during the grace window so
-    the learning log is visible alongside the test."""
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return
-            time.sleep(0.05)
-            continue
-        info(f"    controller: {line.decode(errors='replace').rstrip()}\n")
+def drain_controller(proc: Controller, seconds: float) -> None:
+    """Allow a bounded grace window for controller output."""
+    for _line in proc.lines_for(seconds):
+        pass
 
 
 def main() -> None:
@@ -96,19 +77,17 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=LearningTopo(n_hosts=args.n_hosts), controller=None)
-    net.start()
+    with NetworkRuntime(LearningTopo(n_hosts=args.n_hosts)) as runtime:
+        net = runtime.net
 
-    ctrl = run_controller(args.controller, args.p4info, args.config, args.n_hosts)
-    if not wait_controller_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        if ctrl.stdout:
-            print(ctrl.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        ctrl = run_controller(
+            runtime, args.controller, args.p4info, args.config, args.n_hosts
+        )
+        if not wait_controller_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             info("*** Running pingAll — MAC learning occurs in-flight\n")
             dropped = net.pingAll(timeout="3")
@@ -122,19 +101,13 @@ def main() -> None:
 
             drain_controller(ctrl, 0.5)
             rc = 0 if (dropped == 0 and dropped2 == 0) else 1
-            print("SUCCESS: learning switch reached steady state" if rc == 0
-                  else "FAILURE: one of the pingAll rounds lost packets")
+            print(
+                "SUCCESS: learning switch reached steady state"
+                if rc == 0
+                else "FAILURE: one of the pingAll rounds lost packets"
+            )
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 

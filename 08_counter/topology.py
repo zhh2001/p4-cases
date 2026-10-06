@@ -11,19 +11,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
-import subprocess
 import sys
 import time
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
-from mininet.net import Mininet
 from mininet.topo import Topo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 class CounterTopo(Topo):
@@ -35,61 +33,46 @@ class CounterTopo(Topo):
         self.addLink(h2, sw)
 
 
-def start_controller(controller_bin: str, p4info: str, config: str) -> subprocess.Popen:
+def start_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
+) -> Controller:
     info("*** Launching Go controller (counter reader)\n")
-    return subprocess.Popen(
-        [controller_bin, "-addr", "127.0.0.1:9559", "-p4info", p4info, "-config", config],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-        text=True,
+    return runtime.start_controller(
+        [
+            controller_bin,
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+        ],
+        interactive=True,
     )
 
 
-def wait_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        info(f"    controller: {line.rstrip()}\n")
-        if "counter ready" in line:
-            return True
-    return False
+def wait_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("counter ready", timeout)
 
 
-def dump_counters(proc: subprocess.Popen) -> dict[int, dict[str, int]]:
-    """Send 'dump' to the controller and parse the reply."""
-    proc.stdin.write("dump\n")
-    proc.stdin.flush()
+def dump_counters(proc: Controller) -> dict[int, dict[str, int]]:
+    """Send 'dump' and require a complete reply within four seconds."""
+    proc.send("dump")
     out: dict[int, dict[str, int]] = {}
-    deadline = time.time() + 4.0
-    while time.time() < deadline:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.02)
-            continue
-        line = line.rstrip()
-        info(f"    controller: {line}\n")
+    for line in proc.lines_for(4.0):
         if line == "dump-done":
             return out
         if line.startswith("port="):
             parts = dict(kv.split("=") for kv in line.split())
             p = int(parts["port"])
             out[p] = {"packets": int(parts["packets"]), "bytes": int(parts["bytes"])}
-    return out
+    raise RuntimeError("controller did not complete the counter dump within 4s")
 
 
 def blast(sender, n: int) -> None:
     """Send n scapy Ethernet frames from sender."""
     sender.cmd(
-        "python3 -c \""
+        'python3 -c "'
         "from scapy.all import Ether, sendp; "
         f"[ sendp(Ether(src='00:00:00:00:00:01',dst='00:00:00:00:00:02')/b'P'*60, "
         f"iface='{sender.defaultIntf().name}', verbose=False) for _ in range({n}) ]\""
@@ -105,17 +88,15 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=CounterTopo(), controller=None)
-    net.start()
+    with NetworkRuntime(CounterTopo()) as runtime:
+        net = runtime.net
 
-    ctrl = start_controller(args.controller, args.p4info, args.config)
-    if not wait_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        net.stop()
-        sys.exit(2)
+        ctrl = start_controller(runtime, args.controller, args.p4info, args.config)
+        if not wait_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             h1 = net.get("h1")
 
@@ -127,27 +108,18 @@ def main() -> None:
             info("*** Post-blast counter snapshot\n")
             after = dump_counters(ctrl)
 
-            p1_delta = after.get(1, {}).get("packets", 0) - before.get(1, {}).get("packets", 0)
+            p1_delta = after.get(1, {}).get("packets", 0) - before.get(1, {}).get(
+                "packets", 0
+            )
             print(f"port 1 packet delta = {p1_delta} (expected >= 20)")
             rc = 0 if p1_delta >= 20 else 1
-            print("SUCCESS: port 1 counter incremented by the blasted frames" if rc == 0
-                  else "FAILURE: counter did not capture the blast")
+            print(
+                "SUCCESS: port 1 counter incremented by the blasted frames"
+                if rc == 0
+                else "FAILURE: counter did not capture the blast"
+            )
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            try:
-                ctrl.stdin.write("quit\n")
-                ctrl.stdin.flush()
-            except Exception:
-                pass
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 

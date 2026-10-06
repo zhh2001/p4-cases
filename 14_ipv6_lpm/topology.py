@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -34,6 +33,7 @@ from mininet.topo import Topo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 # Gateway MAC each host puts in the dst field of outgoing frames.
@@ -71,31 +71,30 @@ def configure_ipv6(net: Mininet) -> None:
     time.sleep(0.5)
 
 
-def run_controller(controller_bin: str, p4info: str, config: str) -> subprocess.Popen:
+def run_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
+) -> Controller:
     info("*** Launching Go controller\n")
-    return subprocess.Popen(
-        [controller_bin, "-addr", "127.0.0.1:9559", "-p4info", p4info, "-config", config],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    return runtime.start_controller(
+        [
+            controller_bin,
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+        ],
     )
 
 
-def wait_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        decoded = line.decode(errors="replace").rstrip()
-        info(f"    controller: {decoded}\n")
-        if "ipv6 router ready" in decoded:
-            return True
-    return False
+def wait_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("ipv6 router ready", timeout)
 
 
-def probe(net: Mininet, dst_addr: str, target_iface: str, target_mac: str, n: int = 5) -> int:
+def probe(
+    net: Mininet, dst_addr: str, target_iface: str, target_mac: str, n: int = 5
+) -> int:
     """h1 sends n IPv6 packets to dst_addr. Sniff on target_iface for
     packets that arrive with the expected dst MAC AND hopLimit==63
     (proves both rewrite and decrement happened)."""
@@ -116,7 +115,11 @@ def probe(net: Mininet, dst_addr: str, target_iface: str, target_mac: str, n: in
         "s.start(); s.join()\n"
         "print(len(s.results or []))\n"
     )
-    rx = target.popen(["python3", "-c", sniff_script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    rx = target.popen(
+        ["python3", "-c", sniff_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
     time.sleep(0.5)
 
     send_script = (
@@ -125,7 +128,7 @@ def probe(net: Mininet, dst_addr: str, target_iface: str, target_mac: str, n: in
         f"IPv6(src='2001:db8:1::1', dst='{dst_addr}', hlim=64)/b'ipv6-lpm-probe'\n"
         f"sendp([pkt]*{n}, iface='h1-eth0', verbose=False)\n"
     )
-    h1.cmd(f"python3 -c \"{send_script}\"")
+    h1.cmd(f'python3 -c "{send_script}"')
 
     try:
         out, _ = rx.communicate(timeout=6)
@@ -151,13 +154,17 @@ def probe_dropped(net: Mininet, dst_addr: str, n: int = 5) -> tuple[int, int]:
         # Match anything from h1's IPv6 src — even if the router somehow
         # leaked the packet with wrong MAC, we'd still catch it.
         return host.popen(
-            ["python3", "-c",
-             "from scapy.all import AsyncSniffer, IPv6\n"
-             f"s = AsyncSniffer(iface='{iface}', count={n}, timeout=3,\n"
-             "    lfilter=lambda p: IPv6 in p and p[IPv6].src == '2001:db8:1::1')\n"
-             "s.start(); s.join(); print(len(s.results or []))\n"
+            [
+                "python3",
+                "-c",
+                "from scapy.all import AsyncSniffer, IPv6\n"
+                f"s = AsyncSniffer(iface='{iface}', count={n}, timeout=3,\n"
+                "    lfilter=lambda p: IPv6 in p and p[IPv6].src == '2001:db8:1::1')\n"
+                "s.start(); s.join(); print(len(s.results or []))\n",
             ],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
 
     rx2 = make_sniffer(h2, "h2-eth0")
     rx3 = make_sniffer(h3, "h3-eth0")
@@ -169,7 +176,7 @@ def probe_dropped(net: Mininet, dst_addr: str, n: int = 5) -> tuple[int, int]:
         f"IPv6(src='2001:db8:1::1', dst='{dst_addr}', hlim=64)/b'no-route'\n"
         f"sendp([pkt]*{n}, iface='h1-eth0', verbose=False)\n"
     )
-    h1.cmd(f"python3 -c \"{send_script}\"")
+    h1.cmd(f'python3 -c "{send_script}"')
 
     def harvest(p):
         try:
@@ -205,7 +212,9 @@ def run_test(net: Mininet) -> int:
     print(f"flow D  -> h3 leaked:   {d3}/5  (want 0)")
 
     if a == 5 and b == 5 and c == 5 and d2 == 0 and d3 == 0:
-        print("SUCCESS: IPv6 LPM (longer-prefix wins, hop_limit decrement, dst-MAC rewrite) all working")
+        print(
+            "SUCCESS: IPv6 LPM (longer-prefix wins, hop_limit decrement, dst-MAC rewrite) all working"
+        )
         return 0
     print("FAILURE: IPv6 LPM behaviour does not match expectations")
     return 1
@@ -220,33 +229,20 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=IPv6Topo(), controller=None)
-    net.start()
+    with NetworkRuntime(IPv6Topo()) as runtime:
+        net = runtime.net
 
-    ctrl = run_controller(args.controller, args.p4info, args.config)
-    if not wait_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        if ctrl.stdout:
-            print(ctrl.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        ctrl = run_controller(runtime, args.controller, args.p4info, args.config)
+        if not wait_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             rc = run_test(net)
         else:
             configure_ipv6(net)
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 

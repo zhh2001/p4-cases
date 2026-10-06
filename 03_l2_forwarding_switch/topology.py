@@ -12,10 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
-import subprocess
 import sys
-import time
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
@@ -25,6 +22,7 @@ from mininet.topo import Topo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 def host_ip(n: int) -> str:
@@ -54,35 +52,27 @@ def populate_arp(net: Mininet, n_hosts: int) -> None:
             hi.cmd(f"arp -s 10.0.0.{j} {host_mac(j)}")
 
 
-def run_controller(controller_bin: str, p4info: str, config: str, hosts: int) -> subprocess.Popen:
+def run_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str, hosts: int
+) -> Controller:
     info("*** Launching Go controller to push pipeline + dmac entries\n")
-    return subprocess.Popen(
+    return runtime.start_controller(
         [
             controller_bin,
-            "-addr", "127.0.0.1:9559",
-            "-p4info", p4info,
-            "-config", config,
-            "-hosts", str(hosts),
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+            "-hosts",
+            str(hosts),
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
     )
 
 
-def wait_controller_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        decoded = line.decode(errors="replace").rstrip()
-        info(f"    controller: {decoded}\n")
-        if "l2-forward ready" in decoded:
-            return True
-    return False
+def wait_controller_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("l2-forward ready", timeout)
 
 
 def main() -> None:
@@ -95,38 +85,30 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=L2Topo(n_hosts=args.n_hosts), controller=None)
-    net.start()
-    populate_arp(net, args.n_hosts)
+    with NetworkRuntime(L2Topo(n_hosts=args.n_hosts)) as runtime:
+        net = runtime.net
+        populate_arp(net, args.n_hosts)
 
-    ctrl = run_controller(args.controller, args.p4info, args.config, args.n_hosts)
-    if not wait_controller_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        if ctrl.stdout:
-            print(ctrl.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        ctrl = run_controller(
+            runtime, args.controller, args.p4info, args.config, args.n_hosts
+        )
+        if not wait_controller_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             info("*** Running pingAll across the topology\n")
             dropped = net.pingAll(timeout="2")
             print(f"ping drop ratio: {dropped}%")
             rc = 0 if dropped == 0 else 1
-            print("SUCCESS: full mesh reachable via dmac table" if rc == 0
-                  else "FAILURE: some pings dropped")
+            print(
+                "SUCCESS: full mesh reachable via dmac table"
+                if rc == 0
+                else "FAILURE: some pings dropped"
+            )
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 

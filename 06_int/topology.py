@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -31,6 +30,7 @@ from mininet.topo import Topo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch, reset_port_allocators  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 HOSTS = [
@@ -64,45 +64,40 @@ class INTTopo(Topo):
         self.addLink(s1, s3)  # s1 port 3, s3 port 3
 
 
-def start_controllers(ctrl_bin: str, p4info: str, config: str, switches) -> list[subprocess.Popen]:
+def start_controllers(
+    runtime: NetworkRuntime, ctrl_bin: str, p4info: str, config: str, switches
+) -> list[Controller]:
     """Spawn one controller per switch."""
-    procs: list[subprocess.Popen] = []
+    procs: list[Controller] = []
     for sw_name, device_id, grpc_port in switches:
-        info(f"*** Launching controller for {sw_name} @ :{grpc_port} (switch-id={device_id})\n")
-        p = subprocess.Popen(
+        info(
+            f"*** Launching controller for {sw_name} @ :{grpc_port} (switch-id={device_id})\n"
+        )
+        p = runtime.start_controller(
             [
                 ctrl_bin,
-                "-addr", f"127.0.0.1:{grpc_port}",
-                "-p4info", p4info,
-                "-config", config,
-                "-switch-id", str(device_id),
+                "-addr",
+                f"127.0.0.1:{grpc_port}",
+                "-p4info",
+                p4info,
+                "-config",
+                config,
+                "-switch-id",
+                str(device_id),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            label=sw_name,
         )
         procs.append(p)
     return procs
 
 
-def wait_all_ready(procs: list[subprocess.Popen], timeout: float = 20.0) -> bool:
-    """Wait for each controller to print its ready banner."""
-    remaining = set(range(len(procs)))
-    deadline = time.time() + timeout
-    while remaining and time.time() < deadline:
-        for i in list(remaining):
-            p = procs[i]
-            line = p.stdout.readline() if p.stdout else b""
-            if not line:
-                if p.poll() is not None:
-                    return False
-                continue
-            decoded = line.decode(errors="replace").rstrip()
-            info(f"    ctrl{i + 1}: {decoded}\n")
-            # "s1 ready" / "s2 ready" / "s3 ready"
-            if decoded == f"s{i + 1} ready":
-                remaining.discard(i)
-        time.sleep(0.03)
-    return not remaining
+def wait_all_ready(procs: list[Controller], timeout: float = 20.0) -> bool:
+    """Wait for all controllers within one shared deadline."""
+    deadline = time.monotonic() + timeout
+    return all(
+        proc.wait_ready(f"s{i + 1} ready", max(0, deadline - time.monotonic()))
+        for i, proc in enumerate(procs)
+    )
 
 
 def populate_arp(net: Mininet) -> None:
@@ -129,30 +124,27 @@ def main() -> None:
 
     setLogLevel("info")
     reset_port_allocators()
-    net = Mininet(topo=INTTopo(), controller=None)
-    net.start()
-    populate_arp(net)
+    with NetworkRuntime(INTTopo()) as runtime:
+        net = runtime.net
+        populate_arp(net)
 
-    # The P4RuntimeSwitch class auto-allocated ports 9559, 9560, 9561
-    # in creation order. Read them back.
-    s1 = net.get("s1")
-    s2 = net.get("s2")
-    s3 = net.get("s3")
-    controllers = start_controllers(
-        args.controller, args.p4info, args.config,
-        [("s1", 1, s1.grpc_port), ("s2", 2, s2.grpc_port), ("s3", 3, s3.grpc_port)],
-    )
-    if not wait_all_ready(controllers):
-        print("!!! at least one controller failed to become ready")
-        for i, p in enumerate(controllers):
-            if p.stdout:
-                print(f"--- ctrl{i + 1} remaining ---")
-                print(p.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        # The P4RuntimeSwitch class auto-allocated ports 9559, 9560, 9561
+        # in creation order. Read them back.
+        s1 = net.get("s1")
+        s2 = net.get("s2")
+        s3 = net.get("s3")
+        controllers = start_controllers(
+            runtime,
+            args.controller,
+            args.p4info,
+            args.config,
+            [("s1", 1, s1.grpc_port), ("s2", 2, s2.grpc_port), ("s3", 3, s3.grpc_port)],
+        )
+        if not wait_all_ready(controllers):
+            print("!!! at least one controller failed to become ready")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             h1 = net.get("h1")
             h2 = net.get("h2")
@@ -175,16 +167,6 @@ def main() -> None:
             rc = 0 if b"SUCCESS" in out else 1
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controllers\n")
-        for p in controllers:
-            if p.poll() is None:
-                p.send_signal(signal.SIGTERM)
-                try:
-                    p.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-        net.stop()
 
     sys.exit(rc)
 

@@ -10,19 +10,18 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
-from mininet.net import Mininet
 from mininet.topo import Topo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 class RepeaterTopo(Topo):
@@ -35,34 +34,25 @@ class RepeaterTopo(Topo):
         self.addLink(h2, sw)
 
 
-def run_controller(controller_bin: str, p4info: str, config: str) -> subprocess.Popen:
+def run_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
+) -> Controller:
     info("*** Launching Go controller to push pipeline\n")
-    return subprocess.Popen(
+    return runtime.start_controller(
         [
             controller_bin,
-            "-addr", "127.0.0.1:9559",
-            "-p4info", p4info,
-            "-config", config,
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
     )
 
 
-def wait_controller_ready(proc: subprocess.Popen, timeout: float = 10.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        decoded = line.decode(errors="replace").rstrip()
-        info(f"    controller: {decoded}\n")
-        if "repeater ready" in decoded:
-            return True
-    return False
+def wait_controller_ready(proc: Controller, timeout: float = 10.0) -> bool:
+    return proc.wait_ready("repeater ready", timeout)
 
 
 def main() -> None:
@@ -74,19 +64,15 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=RepeaterTopo(), controller=None)
-    net.start()
+    with NetworkRuntime(RepeaterTopo()) as runtime:
+        net = runtime.net
 
-    ctrl = run_controller(args.controller, args.p4info, args.config)
-    if not wait_controller_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        if ctrl.stdout:
-            print(ctrl.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        ctrl = run_controller(runtime, args.controller, args.p4info, args.config)
+        if not wait_controller_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             h1 = net.get("h1")
             h2 = net.get("h2")
@@ -111,15 +97,6 @@ def main() -> None:
             rc = 0 if b"SUCCESS" in out else 1
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 

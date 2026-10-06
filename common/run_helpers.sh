@@ -14,8 +14,7 @@ fi
 
 CASE_DIR="${CASE_DIR:-$(pwd)}"
 BUILD_DIR="${BUILD_DIR:-${CASE_DIR}/build}"
-LOG_DIR="${LOG_DIR:-/tmp/p4-cases}"
-mkdir -p "${BUILD_DIR}" "${LOG_DIR}"
+TOPOLOGY_PID=""
 
 log() { printf '\033[1;34m[%s]\033[0m %s\n' "$(basename "${CASE_DIR}")" "$*" >&2; }
 die() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -29,6 +28,7 @@ compile_p4() {
     local src="$1"
     local base
     base="$(basename "${src}" .p4)"
+    mkdir -p "${BUILD_DIR}"
     log "Compiling ${src} -> ${BUILD_DIR}/${base}.{json,p4info.txt}"
     p4c -b bmv2 --target bmv2 --arch v1model \
         --std p4-16 \
@@ -38,21 +38,30 @@ compile_p4() {
 }
 
 # start_topology <topology.py> [extra args...]
-# Boots mininet in the background, leaves it running. Use with kill_topology.
+# Wait for this topology and preserve its exit status.
 start_topology() {
     local topo="$1"
     shift
     log "Launching mininet topology: ${topo}"
-    python3 "${topo}" "$@"
+    python3 "${topo}" "$@" <&0 &
+    TOPOLOGY_PID=$!
+    local status=0
+    wait "${TOPOLOGY_PID}" || status=$?
+    TOPOLOGY_PID=""
+    return "${status}"
 }
 
-# kill_topology — tear down any leftover simple_switch_grpc and mn/ovs state.
+# Stop only the topology started by this script. Python owns network cleanup.
 kill_topology() {
-    log "Cleaning up mininet residue"
-    pkill -TERM -f simple_switch_grpc 2>/dev/null || true
-    mn -c >/dev/null 2>&1 || true
+    if [[ -n "${TOPOLOGY_PID}" ]]; then
+        kill -TERM "${TOPOLOGY_PID}" 2>/dev/null || true
+        wait "${TOPOLOGY_PID}" 2>/dev/null || true
+        TOPOLOGY_PID=""
+    fi
 }
 
 trap_cleanup() {
-    trap kill_topology EXIT INT TERM
+    trap kill_topology EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }

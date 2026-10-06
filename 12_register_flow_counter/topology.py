@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -30,6 +29,7 @@ from mininet.topo import Topo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 class RegTopo(Topo):
@@ -41,28 +41,26 @@ class RegTopo(Topo):
         self.addLink(h2, sw)
 
 
-def start_controller(controller_bin: str, p4info: str, config: str) -> subprocess.Popen:
+def start_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
+) -> Controller:
     info("*** Launching Go controller\n")
-    return subprocess.Popen(
-        [controller_bin, "-addr", "127.0.0.1:9559", "-p4info", p4info, "-config", config],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        bufsize=1, text=True,
+    return runtime.start_controller(
+        [
+            controller_bin,
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+        ],
+        interactive=True,
     )
 
 
-def wait_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        info(f"    controller: {line.rstrip()}\n")
-        if "register-counter ready" in line:
-            return True
-    return False
+def wait_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("register-counter ready", timeout)
 
 
 def thrift_register_dump(thrift_port: int) -> dict[int, int]:
@@ -71,7 +69,9 @@ def thrift_register_dump(thrift_port: int) -> dict[int, int]:
     out = subprocess.run(
         ["simple_switch_CLI", "--thrift-port", str(thrift_port)],
         input="register_read flow_counter\n",
-        capture_output=True, text=True, timeout=6,
+        capture_output=True,
+        text=True,
+        timeout=6,
     ).stdout
     info("--- thrift dump (first 400 chars) ---\n")
     info(out[:400] + "\n")
@@ -98,12 +98,12 @@ def thrift_register_dump(thrift_port: int) -> dict[int, int]:
     return rv
 
 
-def run_test(net: Mininet, ctrl: subprocess.Popen, thrift_port: int) -> int:
+def run_test(net: Mininet, ctrl: Controller, thrift_port: int) -> int:
     h1 = net.get("h1")
 
     info("*** Sending 30 identical-5-tuple UDP packets from h1\n")
     h1.cmd(
-        "python3 -c \""
+        'python3 -c "'
         "from scapy.all import Ether, IP, UDP, sendp; "
         "[sendp(Ether(src='00:00:00:00:00:01',dst='00:00:00:00:00:02')/"
         "IP(src='10.0.0.1',dst='10.0.0.2',ttl=64)/"
@@ -126,9 +126,13 @@ def run_test(net: Mininet, ctrl: subprocess.Popen, thrift_port: int) -> int:
     if top_val < 30:
         print(f"FAILURE: top_val={top_val} (want >=30)")
         return 1
-    print(f"SUCCESS: 30-packet flow counted into register slot {top_slot} (val={top_val})")
-    print("(BMv2's P4Runtime register-write is Unimplemented, so controller-side "
-          "seed is skipped; the data-plane increment works as expected.)")
+    print(
+        f"SUCCESS: 30-packet flow counted into register slot {top_slot} (val={top_val})"
+    )
+    print(
+        "(BMv2's P4Runtime register-write is Unimplemented, so controller-side "
+        "seed is skipped; the data-plane increment works as expected.)"
+    )
     return 0
 
 
@@ -141,38 +145,22 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=RegTopo(), controller=None)
-    net.start()
+    with NetworkRuntime(RegTopo()) as runtime:
+        net = runtime.net
 
-    sw = net.get("s1")
-    thrift_port = sw.thrift_port
+        sw = net.get("s1")
+        thrift_port = sw.thrift_port
 
-    ctrl = start_controller(args.controller, args.p4info, args.config)
-    if not wait_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        net.stop()
-        sys.exit(2)
+        ctrl = start_controller(runtime, args.controller, args.p4info, args.config)
+        if not wait_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             rc = run_test(net, ctrl, thrift_port)
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            try:
-                ctrl.stdin.write("quit\n")
-                ctrl.stdin.flush()
-            except Exception:
-                pass
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 

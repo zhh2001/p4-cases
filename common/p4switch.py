@@ -15,15 +15,14 @@ end-to-end.
 from __future__ import annotations
 
 import os
-import signal
 import socket
 import subprocess
-import sys
 import time
 
-from mininet.log import info, warn
+from mininet.log import info
 from mininet.node import Switch
 
+from common.runtime import stop_process
 
 DEFAULT_SWITCH_PATH = "/usr/local/bin/simple_switch_grpc"
 DEFAULT_GRPC_BASE_PORT = 9559
@@ -49,7 +48,7 @@ class P4RuntimeSwitch(Switch):
         grpc_port: int | None = None,
         thrift_port: int | None = None,
         cpu_port: int | None = None,
-        sw_path: str = DEFAULT_SWITCH_PATH,
+        sw_path: str | None = None,
         log_file: str | None = None,
         pcap_dir: str | None = None,
         **kwargs,
@@ -59,7 +58,9 @@ class P4RuntimeSwitch(Switch):
         self.grpc_port = grpc_port or self._alloc_grpc_port()
         self.thrift_port = thrift_port or self._alloc_thrift_port()
         self.cpu_port = cpu_port
-        self.sw_path = sw_path
+        self.sw_path = (
+            sw_path or os.environ.get("P4_SWITCH_PATH") or DEFAULT_SWITCH_PATH
+        )
         self.log_file = log_file or f"/tmp/{name}.log"
         self.pcap_dir = pcap_dir
         self.proc: subprocess.Popen | None = None
@@ -84,6 +85,15 @@ class P4RuntimeSwitch(Switch):
                 "behavioral-model, or set P4_SWITCH_PATH in the env."
             )
 
+        for port in (self.grpc_port, self.thrift_port):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    raise RuntimeError(
+                        f"{self.name}: TCP port {port} is already in use"
+                    )
+            except OSError:
+                pass
+
         # Build -i N@ifname mappings in port order.
         iface_args: list[str] = []
         for port, intf in self.intfs.items():
@@ -95,10 +105,13 @@ class P4RuntimeSwitch(Switch):
         cmd = [
             self.sw_path,
             "--no-p4",
-            "--log-file", self.log_file,
+            "--log-file",
+            self.log_file,
             "--log-flush",
-            "--device-id", str(self.device_id),
-            "--thrift-port", str(self.thrift_port),
+            "--device-id",
+            str(self.device_id),
+            "--thrift-port",
+            str(self.thrift_port),
             *iface_args,
         ]
         if self.pcap_dir:
@@ -106,56 +119,56 @@ class P4RuntimeSwitch(Switch):
             cmd.extend(["--pcap", self.pcap_dir])
         # Separator between BMv2 core args and simple_switch_grpc target args.
         cmd.append("--")
-        cmd.extend([
-            "--grpc-server-addr", f"0.0.0.0:{self.grpc_port}",
-        ])
+        cmd.extend(
+            [
+                "--grpc-server-addr",
+                f"0.0.0.0:{self.grpc_port}",
+            ]
+        )
         if self.cpu_port is not None:
             cmd.extend(["--cpu-port", str(self.cpu_port)])
 
         info(f"*** Starting BMv2 for {self.name} on :{self.grpc_port}\n")
         info("     " + " ".join(cmd) + "\n")
-        log_fd = open(self.log_file + ".stderr", "wb")
-        # Detach into its own process group so SIGINT on mininet does not
-        # race us; we manage lifecycle in stop().
-        self.proc = subprocess.Popen(
-            cmd,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
-
-        # Wait for gRPC to be accepting connections (up to 10 s).
-        if not self._wait_tcp_open("127.0.0.1", self.grpc_port, timeout=10.0):
+        try:
+            # The child keeps its log descriptor; the parent closes its copy.
+            with open(self.log_file + ".stderr", "wb") as log_fd:
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fd,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            if not self._wait_tcp_open("127.0.0.1", self.grpc_port, timeout=10.0):
+                raise RuntimeError(
+                    f"{self.name}: simple_switch_grpc did not open gRPC port "
+                    f"{self.grpc_port}; see {self.log_file} and {self.log_file}.stderr"
+                )
+        except BaseException:
             self.stop()
-            raise RuntimeError(
-                f"{self.name}: simple_switch_grpc gRPC port {self.grpc_port} "
-                f"never opened; see {self.log_file} and {self.log_file}.stderr"
-            )
+            raise
 
     def stop(self, deleteIntfs: bool = True) -> None:  # type: ignore[override]
-        if self.proc and self.proc.poll() is None:
-            info(f"*** Stopping BMv2 for {self.name} (pid {self.proc.pid})\n")
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-                self.proc.wait(timeout=3)
-            except Exception as exc:  # pragma: no cover
-                warn(f"!!! {self.name}: graceful stop failed ({exc}); SIGKILL\n")
-                try:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        self.proc = None
-        super().stop(deleteIntfs=deleteIntfs)
+        try:
+            if self.proc is not None:
+                info(f"*** Stopping BMv2 for {self.name} (pid {self.proc.pid})\n")
+                stop_process(self.proc)
+        finally:
+            self.proc = None
+            super().stop(deleteIntfs=deleteIntfs)
 
-    @staticmethod
-    def _wait_tcp_open(host: str, port: int, timeout: float) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+    def _wait_tcp_open(self, host: str, port: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
+            if self.proc.poll() is not None:
+                return False
             try:
-                with socket.create_connection((host, port), timeout=0.5):
-                    return True
+                with socket.create_connection(
+                    (host, port), timeout=min(0.5, remaining)
+                ):
+                    return self.proc.poll() is None
             except OSError:
-                time.sleep(0.2)
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
         return False
 
 

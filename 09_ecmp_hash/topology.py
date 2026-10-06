@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -25,6 +24,7 @@ from mininet.topo import Topo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
 
 def host_ip(n: int) -> str:
@@ -43,29 +43,25 @@ class EcmpTopo(Topo):
             self.addLink(f"h{i}", sw)
 
 
-def run_controller(controller_bin: str, p4info: str, config: str) -> subprocess.Popen:
+def run_controller(
+    runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
+) -> Controller:
     info("*** Launching Go controller\n")
-    return subprocess.Popen(
-        [controller_bin, "-addr", "127.0.0.1:9559", "-p4info", p4info, "-config", config],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+    return runtime.start_controller(
+        [
+            controller_bin,
+            "-addr",
+            "127.0.0.1:9559",
+            "-p4info",
+            p4info,
+            "-config",
+            config,
+        ],
     )
 
 
-def wait_ready(proc: subprocess.Popen, timeout: float = 15.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        line = proc.stdout.readline() if proc.stdout else b""
-        if not line:
-            if proc.poll() is not None:
-                return False
-            time.sleep(0.05)
-            continue
-        decoded = line.decode(errors="replace").rstrip()
-        info(f"    controller: {decoded}\n")
-        if "ecmp ready" in decoded:
-            return True
-    return False
+def wait_ready(proc: Controller, timeout: float = 15.0) -> bool:
+    return proc.wait_ready("ecmp ready", timeout)
 
 
 def populate_arp(net: Mininet) -> None:
@@ -96,11 +92,13 @@ def run_test(net: Mininet, n_flows: int = 20) -> int:
     )
     rx2 = h2.popen(
         ["python3", "-c", sniff_script.format(iface="h2-eth0", n=n_flows)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
     rx3 = h3.popen(
         ["python3", "-c", sniff_script.format(iface="h3-eth0", n=n_flows)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
     time.sleep(0.6)
 
@@ -110,7 +108,7 @@ def run_test(net: Mininet, n_flows: int = 20) -> int:
     # it. Actually for the test, we want the ECMP path to be exercised
     # specifically; use 10.0.0.100 (hits /24, which is the ECMP entry).
     h1.cmd(
-        "python3 -c \""
+        'python3 -c "'
         "from scapy.all import Ether, IP, UDP, sendp; "
         "[sendp(Ether(src='00:00:00:00:00:01',dst='00:00:00:00:00:01')/"
         "IP(src='10.0.0.1',dst='10.0.0.100',ttl=64)/"
@@ -134,7 +132,9 @@ def run_test(net: Mininet, n_flows: int = 20) -> int:
     print(f"h2 received: {n2}/{n_flows}")
     print(f"h3 received: {n3}/{n_flows}")
     if n2 + n3 >= n_flows and n2 > 0 and n3 > 0:
-        print(f"SUCCESS: ECMP distributed {n2 + n3}/{n_flows} flows across both members")
+        print(
+            f"SUCCESS: ECMP distributed {n2 + n3}/{n_flows} flows across both members"
+        )
         return 0
     print(f"FAILURE: expected both paths to receive >0, got h2={n2} h3={n3}")
     return 1
@@ -157,33 +157,20 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
-    net = Mininet(topo=EcmpTopo(), controller=None)
-    net.start()
-    populate_arp(net)
+    with NetworkRuntime(EcmpTopo()) as runtime:
+        net = runtime.net
+        populate_arp(net)
 
-    ctrl = run_controller(args.controller, args.p4info, args.config)
-    if not wait_ready(ctrl):
-        print("!!! controller did not reach ready state")
-        if ctrl.stdout:
-            print(ctrl.stdout.read().decode(errors="replace"))
-        net.stop()
-        sys.exit(2)
+        ctrl = run_controller(runtime, args.controller, args.p4info, args.config)
+        if not wait_ready(ctrl):
+            print("!!! controller did not reach ready state")
+            sys.exit(2)
 
-    rc = 0
-    try:
+        rc = 0
         if args.run_test:
             rc = run_test(net)
         else:
             CLI(net)
-    finally:
-        info("*** Stopping controller\n")
-        if ctrl.poll() is None:
-            ctrl.send_signal(signal.SIGTERM)
-            try:
-                ctrl.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ctrl.kill()
-        net.stop()
 
     sys.exit(rc)
 
