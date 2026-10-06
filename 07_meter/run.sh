@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Case 07: meter-based policing (indirect meter variant).
 #
-#   sudo ./run.sh        # blast test, expect non-metered > metered
+#   sudo ./run.sh        # check burst policing, delivery and token refill
 #   sudo ./run.sh cli    # drop into mininet CLI after bring-up
 
 set -euo pipefail
@@ -27,7 +27,7 @@ if [[ "${MODE}" == "test" ]]; then
     EXTRA+=(--run-test)
 fi
 
-log "Starting mininet + controller + (optional) blast test"
+log "Starting mininet + controller + (optional) meter test"
 start_topology "${CASE_DIR}/topology.py" \
     --p4info "${BUILD_DIR}/indirect_meter.p4info.txt" \
     --config "${BUILD_DIR}/indirect_meter.json" \

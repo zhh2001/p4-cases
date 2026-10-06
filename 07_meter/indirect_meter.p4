@@ -76,6 +76,7 @@ control MyIngress(inout headers hdr,
 
     apply {
         standard_metadata.egress_spec = 2;
+        meta.meter_tag = 0;
         m_read.apply();
         m_filter.apply();
     }

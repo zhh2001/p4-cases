@@ -7,10 +7,10 @@
 // stay green, so they always pass.
 //
 // The controller installs:
-//   * m_read entry mapping the "metered" src MAC to meter index 0
-//   * m_filter entry matching tag=0 -> NoAction (pass)
-//   * a MeterEntry configuring index 0 with a tight CIR so bursty
-//     traffic turns red and gets dropped.
+//   - m_read entry mapping the "metered" src MAC to meter index 0
+//   - m_filter entry matching tag=0 -> NoAction (pass)
+//   - a MeterEntry configuring index 0 with a tight CIR so bursty
+//     traffic turns yellow or red and gets dropped.
 package main
 
 import (
@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	p4v1 "github.com/p4lang/p4runtime/go/p4/v1"
 	"github.com/zhh2001/p4runtime-go-controller/client"
 	"github.com/zhh2001/p4runtime-go-controller/codec"
 	"github.com/zhh2001/p4runtime-go-controller/meter"
@@ -34,6 +35,29 @@ const (
 	meteredMAC = "aa:aa:aa:aa:aa:aa"
 	meterIndex = 0
 )
+
+func validateConfig(cfg meter.Config) error {
+	if cfg.CIR <= 0 || cfg.CBurst <= 0 || cfg.PIR <= 0 || cfg.PBurst <= 0 {
+		return fmt.Errorf("meter rates and burst sizes must be positive")
+	}
+	if cfg.PIR < cfg.CIR {
+		return fmt.Errorf("peak rate must be at least the committed rate")
+	}
+	return nil
+}
+
+func checkMeterConfig(entries []*p4v1.MeterEntry, expected meter.Config) error {
+	if len(entries) != 1 || entries[0] == nil || entries[0].GetIndex() == nil ||
+		entries[0].GetIndex().GetIndex() != meterIndex || entries[0].GetConfig() == nil {
+		return fmt.Errorf("expected one configured meter at index %d", meterIndex)
+	}
+	got := entries[0].GetConfig()
+	if got.GetCir() != expected.CIR || got.GetCburst() != expected.CBurst ||
+		got.GetPir() != expected.PIR || got.GetPburst() != expected.PBurst {
+		return fmt.Errorf("meter configuration differs: %v", got)
+	}
+	return nil
+}
 
 func main() {
 	var (
@@ -49,6 +73,10 @@ func main() {
 	flag.Parse()
 	if *p4info == "" || *config == "" {
 		log.Fatal("-p4info and -config are required")
+	}
+	meterConfig := meter.Config{CIR: *cir, CBurst: *cburst, PIR: *pir, PBurst: *pburst}
+	if err := validateConfig(meterConfig); err != nil {
+		log.Fatalf("meter configuration: %v", err)
 	}
 
 	infoBytes, err := os.ReadFile(*p4info)
@@ -120,10 +148,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("meter reader: %v", err)
 	}
-	if err := mr.Write(ctx, "MyIngress.my_meter", meterIndex, meter.Config{
-		CIR: *cir, CBurst: *cburst, PIR: *pir, PBurst: *pburst,
-	}); err != nil {
+	if err := mr.Write(ctx, "MyIngress.my_meter", meterIndex, meterConfig); err != nil {
 		log.Fatalf("configure meter: %v", err)
+	}
+	entries, err := mr.Read(ctx, "MyIngress.my_meter", meterIndex)
+	if err != nil {
+		log.Fatalf("read meter configuration: %v", err)
+	}
+	if err := checkMeterConfig(entries, meterConfig); err != nil {
+		log.Fatalf("verify meter configuration: %v", err)
 	}
 	log.Printf("meter[%d]: CIR=%d cburst=%d PIR=%d pburst=%d",
 		meterIndex, *cir, *cburst, *pir, *pburst)

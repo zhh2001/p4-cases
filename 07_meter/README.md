@@ -1,83 +1,131 @@
-# 🚦 Case 07 · 双速率三色计量器(Meter)
+# Case 07：按源 MAC 计量流量
 
-> **学习目标**: P4 的 **meter extern**——按源 MAC 对流量做"三色"分类,并对非绿色流量丢包。控制器通过 P4Runtime `MeterEntry` 配置速率。
+本案例使用双速率三色计量器，按源 MAC 选择计量实例。只转发绿色报文，黄色和红色报文都会被丢弃。
 
-## 什么是 meter?
+拓扑为 `h1 → s1 → h2`。数据面固定使用出端口 2，演示 h1 到 h2 的单向流量，不提供双向交换或 IP 路由。
 
-双速率三色标记(trTCM)简化版:
-- **Green (tag=0)**: 低于 CIR(承诺速率),通过。
-- **Yellow (tag=1)**: CIR 和 PIR 之间,转发但标记。
-- **Red (tag=2)**: 超出 PIR,丢弃(典型语义;本例中非 green 即丢)。
+## 颜色与速率
 
-## Pipeline 两张表
+v1model 的 meter 返回三种颜色：
 
-```
-apply {
-    standard_metadata.egress_spec = 2;   // 任意包默认出 port 2
-    m_read.apply();                      // src MAC → 选 meter 实例 → 写入 meta.meter_tag
-    m_filter.apply();                    // 根据 meta.meter_tag 决定过/丢
-}
-```
+| 颜色 | 值  | 本案例的动作 |
+| ---- | --- | ------------ |
+| 绿色 | 0   | 转发         |
+| 黄色 | 1   | 丢弃         |
+| 红色 | 2   | 丢弃         |
 
-`m_read` 命中时执行 `my_meter.execute_meter(index, meta.meter_tag)`;未命中则 tag 保持 0(默认 green)。`m_filter` 只为 tag=0 配置了 NoAction,其余 tag 被**默认 action = drop** 吞掉。
+CIR 是承诺速率，PIR 是峰值速率。CBurst 和 PBurst 分别表示对应令牌桶的容量。令牌随时间补充，达到桶容量后不再增加。双速率三色标记的背景见 [RFC 2698](https://www.rfc-editor.org/rfc/rfc2698)。本案例使用 `MeterType.packets`，速率单位为包每秒，桶容量单位为包。
 
-## 本案例的配置
+控制器的默认配置如下，自动测试也明确使用这些参数：
 
-| MAC | 效果 |
-| --- | --- |
-| `aa:aa:aa:aa:aa:aa` | 命中 `m_read` → meter 着色 → 超速即丢 |
-| 其它 | 跳过 meter → 始终 green → 始终通过 |
-
-meter 速率(`controller/main.go` 里通过 flag 可调):
-
-```
+```text
 CIR=10 pps   CBurst=5 packets
 PIR=20 pps   PBurst=10 packets
 ```
 
-## 文件
+控制器支持 `-cir`、`-cburst`、`-pir`、`-pburst` 参数。速率和桶容量必须为正，PIR 不得小于 CIR。配置写入后，控制器读回计量实例 0，确认四个参数一致才输出就绪信息。
 
-| 文件 | 作用 |
-| --- | --- |
-| `indirect_meter.p4` | 间接 meter (8192 个实例,action 参数选实例) |
-| `direct_meter.p4` | 直接 meter (绑定在表上,实例即条目,供参考对比) |
-| `topology.py` | 2 主机拓扑;发两组突发流量并统计收到数量 |
-| `controller/main.go` | 推 pipeline + 写 `m_read` + `m_filter` + `MeterEntry` 配速率 |
+## 两张表
 
-## Go 控制器要点
-
-```go
-mr, _ := meter.NewReader(c, p)
-mr.Write(ctx, "MyIngress.my_meter", meterIndex /*0*/, meter.Config{
-    CIR: 10, CBurst: 5, PIR: 20, PBurst: 10,
-})
+```p4
+apply {
+    standard_metadata.egress_spec = 2;
+    meta.meter_tag = 0;
+    m_read.apply();
+    m_filter.apply();
+}
 ```
 
-SDK 的 `meter.NewReader` 虽然名字含 Reader,但 Read 和 Write 都提供。Write 对应 P4Runtime 的 `MeterEntry` MODIFY。
+每个报文进入处理逻辑时，`meter_tag` 显式初始化为绿色。`m_read` 按源 MAC 选择实例，命中时执行计量并更新颜色，未命中时保持绿色。`m_filter` 只配置 `tag=0 → NoAction`，默认动作丢弃其他颜色。
 
-## 运行
+| 源 MAC              | 行为                                           |
+| ------------------- | ---------------------------------------------- |
+| `aa:aa:aa:aa:aa:aa` | 命中 `m_read`，使用实例 0 计量，只转发绿色报文 |
+| 其他 MAC            | 跳过计量，保持绿色并转发                       |
+
+间接计量器包含 8192 个实例，由 action 参数指定实例索引。`direct_meter.p4` 展示直接计量器与表项绑定的写法，也显式初始化颜色。它作为源码对照参与编译检查，`run.sh` 和本案例的控制器使用间接计量器。
+
+## 文件
+
+| 文件                 | 作用                                     |
+| -------------------- | ---------------------------------------- |
+| `indirect_meter.p4`  | 按索引执行计量，按颜色过滤               |
+| `direct_meter.p4`    | 展示直接计量器与表项绑定                 |
+| `controller/main.go` | 安装表项，校验参数并写入、读回计量配置   |
+| `topology.py`        | 创建拓扑，验证突发、丢包和令牌恢复       |
+| `test.py`            | 使用原始套接字发送和捕获完整帧，记录时间 |
+| `run.sh`             | 编译并启动测试或交互模式                 |
+
+## Go 控制器
+
+```go
+mr, err := meter.NewReader(c, p)
+if err != nil {
+    log.Fatalf("meter reader: %v", err)
+}
+if err := mr.Write(ctx, "MyIngress.my_meter", meterIndex, meterConfig); err != nil {
+    log.Fatalf("configure meter: %v", err)
+}
+entries, err := mr.Read(ctx, "MyIngress.my_meter", meterIndex)
+if err != nil {
+    log.Fatalf("read meter configuration: %v", err)
+}
+if err := checkMeterConfig(entries, meterConfig); err != nil {
+    log.Fatalf("verify meter configuration: %v", err)
+}
+```
+
+SDK 的 `meter.NewReader` 同时提供 Read 和 Write。Write 使用 P4Runtime 的 `MeterEntry` MODIFY，Read 返回配置，不返回实时令牌余额或报文颜色。
+
+## 运行和验证
 
 ```bash
+cd 07_meter
 sudo ./run.sh
 ```
 
-## 预期输出
+收发脚本只使用 Python 标准库的原始套接字，需要 root 权限，不需要 Scapy。每轮突发预先生成报文，并通过一个套接字连续发送。
 
-```
-    controller: m_read: src=aa:aa:aa:aa:aa:aa -> m_action(index=0)
-    controller: m_filter: tag=0 -> NoAction (non-zero tags drop via default)
-    controller: meter[0]: CIR=10 cburst=5 PIR=20 pburst=10
-    controller: meter-switch ready: metered src=aa:aa:aa:aa:aa:aa, cburst=5 packets
-*** Phase 1: send 30 packets from non-metered src (expect ~30 on h2)
-*** Phase 2: send 30 packets from metered src (expect partial drop)
-Unmetered received: 30/30
-Metered   received: 22/30
-SUCCESS: non-metered MAC passes, metered MAC experiences drops
+测试依次验证四个阶段，共发送 95 帧：
+
+| 阶段                 | 发送数 | 要求                                            |
+| -------------------- | ------ | ----------------------------------------------- |
+| 非计量源，计量测试前 | 30     | 全部收到                                        |
+| 计量源突发           | 30     | 最初 5 帧通过，后续按令牌预算受限，必须出现丢包 |
+| 计量源补充令牌后     | 5      | 全部收到                                        |
+| 非计量源，计量测试后 | 30     | 全部收到                                        |
+
+计量阶段根据实际发送和接收时间计算上限 `CBurst + ceil(CIR × elapsed)`。计时涵盖首次发送到最后一次发送或接收的时段，向上取整为令牌补充留出边界余量。整个突发必须在 0.5 秒内完成，因此默认配置下最多允许 10 帧通过。超过时限会明确报告时序不满足要求。
+
+恢复阶段在前一阶段捕获结束后，再等待 `CBurst / CIR + 0.1` 秒，确认计量源能重新通过完整的承诺突发。这样可以识别把该源永久丢弃的错误实现。
+
+测试帧带有本轮随机标识、阶段号和序号，长度覆盖 60、80、100、120 字节。捕获进程按源 MAC 筛选原始帧，避免依赖高层协议解析。收到的每帧必须属于本阶段，内容完全一致且没有重复。非计量和恢复阶段必须完整交付，计量阶段也必须收到最初的承诺突发，因此空捕获不能判定为成功。
+
+捕获进程报告就绪后才启动发送。发送、捕获、回复格式、超时或控制器退出都会使测试失败，并清理本次启动的进程。
+
+一次正常输出如下，计时和计量帧数可能有小幅变化：
+
+```text
+unmetered-before: received=30/30, expected=30, burst=0.007021s
+metered-burst: received=5/30, expected=5..6, burst=0.001710s
+metered-after-refill: received=5/5, expected=5, burst=0.001550s
+unmetered-after: received=30/30, expected=30, burst=0.006282s
+SUCCESS: unmetered delivery, burst policing and token refill match expectations
 ```
 
-`22/30` 的具体数字会因调度和 BMv2 实时抖动略有不同,但**必然明显低于 30**。
+交互模式使用同一组计量配置：
+
+```bash
+sudo ./run.sh cli
+```
+
+在仓库根目录执行无需交换机的测试：
+
+```bash
+python3 -m unittest discover -s tests -p test_meter.py -v
+go test ./07_meter/controller
+```
 
 ## 延伸
 
-- **Yellow 单独处理**:再加一个 `m_filter` 条目 `tag=1 → some_action` 来放行但标记(如改 DSCP)。
-- **Direct meter**:`direct_meter.p4` 里 meter 绑在 `m_read` 表上,实例即表条目。
+可为 `m_filter` 增加黄色报文的处理动作，例如转发并标记 DSCP。使用直接计量器时，需要将配置写到对应表项的直接计量资源，不能沿用这里的间接 `MeterEntry` 索引配置。
