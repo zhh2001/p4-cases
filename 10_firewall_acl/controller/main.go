@@ -3,12 +3,12 @@
 // Installs a small L2 forwarding table and a set of TERNARY ACL rules
 // with explicit priorities:
 //
-//   prio=100  DENY  any src -> 10.0.0.2, TCP, dport=22       (block SSH to h2)
-//   prio= 90  ALLOW any src -> 10.0.0.2, TCP, any dport      (allow other TCP to h2)
-//   prio= 80  DENY  10.0.0.1 -> any, UDP, dport=5000          (block a specific UDP flow)
+//	prio=100  DENY  any src -> 10.0.0.2, TCP, dport=22       (block SSH to h2)
+//	prio= 90  ALLOW any src -> 10.0.0.2, TCP, any dport      (allow other TCP to h2)
+//	prio= 80  DENY  10.0.0.1 -> any, UDP, dport=5000          (block a specific UDP flow)
 //
-// The acl table's default_action is `allow`, so anything not matched
-// passes through.
+// Packets accepted by the parser use the acl table's default_action
+// `allow` when no rule matches.
 package main
 
 import (
@@ -93,11 +93,9 @@ func main() {
 		log.Printf("dmac %s -> port %d", mac, n)
 	}
 
-	wildMask32 := []byte{0x00, 0x00, 0x00, 0x00} // all-zero mask == don't care
 	exactMask32 := []byte{0xff, 0xff, 0xff, 0xff}
 	exactMask8 := []byte{0xff}
 	exactMask16 := []byte{0xff, 0xff}
-	_ = wildMask32
 
 	// Rule 1: highest priority DENY — TCP/22 to h2.
 	rule1, err := tableentry.NewBuilder(p, "MyIngress.acl").

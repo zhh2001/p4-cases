@@ -118,7 +118,7 @@ p4-cases/
 | 07      | metered 源的通过率 明显 < 非 metered 源                                                                             |
 | 08      | port 1 counter 增量 ≥ 我们注入的包数                                                                                |
 | 09      | h2 和 h3 均收到 >0 的 ECMP 分发流量                                                                                 |
-| 10      | 4 条流的 allow/deny 结果与规则优先级一致                                                                            |
+| 10      | 按 IHL 读取端口，核对双向正常和 Options 流量，丢弃 IPv4 分片及所检查的格式异常报文                                  |
 | 11      | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对                                                                          |
 | 12      | Thrift 读出 register 某 slot = 注入包数                                                                             |
 | 13      | 双向各发送 10 帧，逐包核对主机收到的原包和控制器收到的副本，并检查 CPU 头中的入端口                                 |

@@ -2,7 +2,7 @@
 """Mininet topology for Case 10: Firewall ACL.
 
 Single switch, two hosts (h1 = 10.0.0.1, h2 = 10.0.0.2). Tests drive
-three flows and assert the DENY / ALLOW decisions:
+flows with and without IPv4 options, malformed headers and fragments:
 
   1. h1 -> h2  TCP/80    (allowed by rule 2 at prio 90)
   2. h1 -> h2  TCP/22    (denied by rule 1 at prio 100)
@@ -13,10 +13,16 @@ three flows and assert the DENY / ALLOW decisions:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import importlib
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
@@ -27,6 +33,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch  # noqa: E402
 from common.runtime import Controller, NetworkRuntime  # noqa: E402
+
+packets = importlib.import_module("10_firewall_acl.packets")
 
 
 class ACLTopo(Topo):
@@ -59,97 +67,274 @@ def wait_ready(proc: Controller, timeout: float = 15.0) -> bool:
     return proc.wait_ready("firewall ready", timeout)
 
 
-def populate_arp(net: Mininet) -> None:
-    h1 = net.get("h1")
-    h2 = net.get("h2")
-    h1.cmd("arp -s 10.0.0.2 00:00:00:00:00:02")
-    h2.cmd("arp -s 10.0.0.1 00:00:00:00:00:01")
+def test_vectors(prefix: bytes) -> list[dict]:
+    """Build independently labelled packets for each expected ACL decision."""
+    if len(prefix) != 4:
+        raise ValueError("test prefix must contain four MAC bytes")
+    probes = []
+    sequence = 0
 
-
-def probe(sender, iface_peer: str, proto: str, dport: int, n: int = 5) -> int:
-    """Send n probes. Returns count received on peer."""
-    # sniffer on peer
-    script = (
-        "from scapy.all import AsyncSniffer, TCP, UDP; "
-        "s = AsyncSniffer(iface='{iface}', count={n}, timeout=3, "
-        "lfilter=lambda p: ({proto} in p) and (p[{proto}].dport == {dport})); "
-        "s.start(); s.join(); print(len(s.results or []))"
-    ).format(iface=iface_peer, proto=proto, dport=dport, n=n)
-    rx = sender.peer.popen(
-        ["python3", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
-    time.sleep(0.4)
-
-    # sender blasts n probes
-    layer = "TCP" if proto == "TCP" else "UDP"
-    sender.cmd(
-        'python3 -c "'
-        "from scapy.all import Ether, IP, {layer}, sendp; "
-        "[sendp(Ether(src='{smac}',dst='{dmac}')/"
-        "IP(src='{sip}',dst='{dip}',ttl=64)/"
-        "{layer}(sport=4000+i, dport={dport})/b'acl-probe', "
-        "iface='{iface}', verbose=False) for i in range({n})]\"".format(
-            layer=layer,
-            smac=sender.mac,
-            dmac=sender.peer_mac,
-            sip=sender.ip,
-            dip=sender.peer_ip,
-            dport=dport,
-            iface=sender.iface,
-            n=n,
+    def add(
+        name,
+        sender,
+        proto,
+        dport,
+        options=b"",
+        allowed=True,
+        fault="",
+        flags=0,
+        offset=0,
+    ):
+        nonlocal sequence
+        receiver = "h2" if sender == "h1" else "h1"
+        src_ip = "10.0.0.1" if sender == "h1" else "10.0.0.2"
+        dst_ip = "10.0.0.2" if receiver == "h2" else "10.0.0.1"
+        dst_mac = bytes.fromhex("000000000002" if receiver == "h2" else "000000000001")
+        frames = []
+        for _ in range(5):
+            sequence += 1
+            frames.append(
+                packets.make_frame(
+                    prefix + sequence.to_bytes(2, "big"),
+                    dst_mac,
+                    src_ip,
+                    dst_ip,
+                    proto,
+                    dport,
+                    options,
+                    sequence,
+                    fault,
+                    flags,
+                    offset,
+                )
+            )
+        probes.append(
+            {
+                "name": name,
+                "sender": sender,
+                "receiver": receiver,
+                "allowed": allowed,
+                "frames": frames,
+            }
         )
-    )
+
+    flows = [
+        ("TCP", 80, True),
+        ("TCP", 22, False),
+        ("UDP", 5000, False),
+        ("UDP", 1234, True),
+    ]
+    for proto, port, allowed in flows:
+        misleading = (
+            22
+            if proto == "TCP" and allowed
+            else 80 if proto == "TCP" else 5000 if allowed else 1234
+        )
+        shapes = [
+            ("plain", b""),
+            ("options4", b"\x01" * 4),
+            ("options40", b"\x01" * 40),
+            ("port-like-options", b"\x94\x04" + misleading.to_bytes(2, "big")),
+        ]
+        for shape, options in shapes:
+            add(
+                f"h1-{proto.lower()}{port}-{shape}", "h1", proto, port, options, allowed
+            )
+        for shape, options in (("plain", b""), ("options40", b"\x01" * 40)):
+            add(f"h2-{proto.lower()}{port}-{shape}", "h2", proto, port, options)
+    add("icmp-plain", "h1", "ICMP", 0)
+    add("icmp-options40", "h1", "ICMP", 0, b"\x01" * 40)
+    add("arp", "h1", "ARP", 0)
+    add("tcp-dont-fragment", "h1", "TCP", 80, flags=2)
+    for fault in (
+        "bad-version",
+        "short-ihl",
+        "short-total",
+        "long-total",
+        "truncated-ip",
+        "truncated-options",
+        "short-tcp",
+        "short-udp",
+    ):
+        proto = "UDP" if fault == "short-udp" else "TCP"
+        options = b"\x01" * 40 if fault in ("short-total", "truncated-options") else b""
+        add(fault, "h1", proto, 1234 if proto == "UDP" else 80, options, False, fault)
+    for proto, port in (("TCP", 80), ("UDP", 1234)):
+        add(
+            f"{proto.lower()}-first-fragment", "h1", proto, port, allowed=False, flags=1
+        )
+        add(
+            f"{proto.lower()}-later-fragment",
+            "h1",
+            proto,
+            port,
+            allowed=False,
+            offset=1,
+        )
+    return probes
+
+
+def read_probe(proc: subprocess.Popen, timeout: float = 6) -> dict:
+    output, error = proc.communicate(timeout=timeout)
+    if proc.returncode:
+        raise RuntimeError(f"packet probe failed: {output.strip()} {error.strip()}")
     try:
-        out, _ = rx.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        rx.kill()
-        out, _ = rx.communicate()
-    for line in reversed((out or b"").decode(errors="replace").splitlines()):
-        line = line.strip()
-        if line.isdigit():
-            return int(line)
+        reply = json.loads(output)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("packet probe returned invalid JSON") from exc
+    if not isinstance(reply, dict):
+        raise RuntimeError("packet probe reply must be an object")
+    return reply
+
+
+def frame_list(reply: dict) -> list[bytes]:
+    frames = reply.get("frames")
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, str) for frame in frames
+    ):
+        raise RuntimeError("capture reply must contain a frame list")
+    try:
+        return [bytes.fromhex(frame) for frame in frames]
+    except ValueError as exc:
+        raise RuntimeError("capture reply contains invalid frame bytes") from exc
+
+
+def check_delivery(probes: list[dict], received: dict[str, list[bytes]]) -> None:
+    errors = []
+    for host in ("h1", "h2"):
+        actual = received.get(host)
+        if not isinstance(actual, list):
+            raise RuntimeError(f"missing capture from {host}")
+        expected = [
+            frame
+            for probe in probes
+            if probe["receiver"] == host and probe["allowed"]
+            for frame in probe["frames"]
+        ]
+        if Counter(actual) != Counter(expected):
+            errors.append(
+                f"{host} received {len(actual)} frames, expected {len(expected)} with exact contents"
+            )
+    for probe in probes:
+        sources = {frame[6:12] for frame in probe["frames"]}
+        observed = [
+            frame for frame in received[probe["receiver"]] if frame[6:12] in sources
+        ]
+        wanted = len(probe["frames"]) if probe["allowed"] else 0
+        print(
+            f"{probe['name']}: received={len(observed)}/{len(probe['frames'])}, expected={wanted}"
+        )
+        if len(observed) != wanted:
+            errors.append(
+                f"{probe['name']} received {len(observed)}, expected {wanted}"
+            )
+    if errors:
+        raise RuntimeError("ACL delivery differs: " + ", ".join(errors))
+
+
+def stop_probe(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def run_test(net: Mininet, ctrl: Controller | None = None) -> int:
+    procs = []
+    try:
+        prefix = b"\x02" + uuid.uuid4().bytes[:3]
+        probes = test_vectors(prefix)
+        info(f"*** Checking {len(probes)} ACL scenarios with five frames each\n")
+        with tempfile.TemporaryDirectory(prefix="p4-acl-") as directory:
+            receivers = {}
+            for name in ("h1", "h2"):
+                host = net.get(name)
+                ready = Path(directory) / f"{name}-ready"
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/test.py",
+                        "receive",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--prefix",
+                        prefix.hex(),
+                        "--ready",
+                        str(ready),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                receivers[name] = (proc, ready)
+            deadline = time.monotonic() + 3
+            while not all(
+                ready.exists() and ready.read_text() == "ready\n"
+                for _, ready in receivers.values()
+            ):
+                if time.monotonic() >= deadline or any(
+                    proc.poll() is not None for proc, _ in receivers.values()
+                ):
+                    raise RuntimeError("packet receivers did not become ready")
+                time.sleep(0.02)
+            for name in ("h1", "h2"):
+                host = net.get(name)
+                frames = [
+                    frame
+                    for probe in probes
+                    if probe["sender"] == name
+                    for frame in probe["frames"]
+                ]
+                manifest = Path(directory) / f"{name}-frames.json"
+                manifest.write_text(json.dumps([frame.hex() for frame in frames]))
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/test.py",
+                        "send",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--frames",
+                        str(manifest),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                reply = read_probe(proc, timeout=5)
+                if type(reply.get("sent")) is not int or reply["sent"] != len(frames):
+                    raise RuntimeError("sender did not confirm all test frames")
+            received = {
+                name: frame_list(read_probe(proc))
+                for name, (proc, _) in receivers.items()
+            }
+            check_delivery(probes, received)
+            if ctrl is not None and ctrl.proc.poll() is not None:
+                raise RuntimeError("controller exited during the ACL test")
+    except (
+        RuntimeError,
+        OSError,
+        subprocess.TimeoutExpired,
+        ValueError,
+        TypeError,
+    ) as exc:
+        print(f"FAILURE: {exc}")
+        return 1
+    finally:
+        for proc in procs:
+            stop_probe(proc)
+    print(
+        "SUCCESS: ACL decisions, IPv4 options and rejected packets match expectations"
+    )
     return 0
-
-
-class Sender:
-    """Convenience wrapper bundling the sender host + its peer for probe()."""
-
-    def __init__(self, net: Mininet, me: str, peer: str, dst_ip: str, dst_mac: str):
-        self.h = net.get(me)
-        self.peer = net.get(peer)
-        self.ip = self.h.IP()
-        self.mac = self.h.MAC()
-        self.iface = self.h.defaultIntf().name
-        self.peer_ip = dst_ip
-        self.peer_mac = dst_mac
-
-    def cmd(self, c):
-        return self.h.cmd(c)
-
-
-def run_test(net: Mininet) -> int:
-    populate_arp(net)
-    s = Sender(net, "h1", "h2", "10.0.0.2", "00:00:00:00:00:02")
-
-    info("*** flow 1: TCP/80 (expect ALLOW via rule 2)\n")
-    r1 = probe(s, "h2-eth0", "TCP", 80, n=5)
-    info("*** flow 2: TCP/22 (expect DENY via rule 1)\n")
-    r2 = probe(s, "h2-eth0", "TCP", 22, n=5)
-    info("*** flow 3: UDP/5000 (expect DENY via rule 3)\n")
-    r3 = probe(s, "h2-eth0", "UDP", 5000, n=5)
-    info("*** flow 4: UDP/1234 (expect ALLOW via default_action)\n")
-    r4 = probe(s, "h2-eth0", "UDP", 1234, n=5)
-
-    print(f"TCP/80  received: {r1}/5  (want 5)")
-    print(f"TCP/22  received: {r2}/5  (want 0)")
-    print(f"UDP/5000 received: {r3}/5  (want 0)")
-    print(f"UDP/1234 received: {r4}/5  (want 5)")
-
-    if r1 == 5 and r2 == 0 and r3 == 0 and r4 == 5:
-        print("SUCCESS: ACL rules + priorities + default action all working")
-        return 0
-    print("FAILURE: ACL behaviour does not match expectations")
-    return 1
 
 
 def main() -> None:
@@ -171,7 +356,7 @@ def main() -> None:
 
         rc = 0
         if args.run_test:
-            rc = run_test(net)
+            rc = run_test(net, ctrl)
         else:
             CLI(net)
 

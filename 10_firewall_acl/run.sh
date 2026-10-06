@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Case 10: firewall ACL.
+# sudo ./run.sh checks ACL decisions, IPv4 options and rejected packets.
 set -euo pipefail
 CASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${CASE_DIR}/.." && pwd)"

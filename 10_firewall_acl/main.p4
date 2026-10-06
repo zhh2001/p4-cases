@@ -4,7 +4,7 @@
  *
  * Pipeline does a simple L2 forward (like Case 03) then applies a
  * TERNARY acl table keyed on (srcIP, dstIP, ipProto, dstPort). The
- * first matching entry wins; entries have a priority, so specific
+ * matching entry with the highest priority wins, so specific
  * rules can override generic ones (typical firewall semantics).
  *
  * An ACL entry's action is either `allow` (no-op) or `deny` (drop).
@@ -14,6 +14,12 @@
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV4 = 0x0800;
+
+error {
+    InvalidIPv4Version,
+    InvalidIPv4Length,
+    IPv4Fragment
+}
 
 typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
@@ -47,11 +53,16 @@ header l4_ports_t {
     bit<16> dstPort;
 }
 
+header ipv4_options_t {
+    varbit<320> data;
+}
+
 struct metadata {}
 
 struct headers {
     ethernet_t ethernet;
     ipv4_t     ipv4;
+    ipv4_options_t options;
     l4_ports_t l4;
 }
 
@@ -68,11 +79,39 @@ parser MyParser(packet_in packet,
     }
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
+        verify(hdr.ipv4.version == 4, error.InvalidIPv4Version);
+        verify(hdr.ipv4.ihl >= 5, error.InvalidIPv4Length);
+        verify(hdr.ipv4.totalLen >= (bit<16>)hdr.ipv4.ihl * 4,
+               error.InvalidIPv4Length);
+        verify((bit<32>)hdr.ipv4.totalLen <= standard_metadata.packet_length - 14,
+               error.InvalidIPv4Length);
+        verify(hdr.ipv4.fragOffset == 0 && hdr.ipv4.flags[0:0] == 0,
+               error.IPv4Fragment);
+        transition select(hdr.ipv4.ihl) {
+            5:       parse_protocol;
+            default: parse_options;
+        }
+    }
+    state parse_options {
+        packet.extract(hdr.options, ((bit<32>)hdr.ipv4.ihl - 5) * 32);
+        transition parse_protocol;
+    }
+    state parse_protocol {
         transition select(hdr.ipv4.protocol) {
-            6:       parse_l4;   // TCP
-            17:      parse_l4;   // UDP
+            6:       parse_tcp;
+            17:      parse_udp;
             default: accept;
         }
+    }
+    state parse_tcp {
+        verify(hdr.ipv4.totalLen >= (bit<16>)hdr.ipv4.ihl * 4 + 20,
+               error.InvalidIPv4Length);
+        transition parse_l4;
+    }
+    state parse_udp {
+        verify(hdr.ipv4.totalLen >= (bit<16>)hdr.ipv4.ihl * 4 + 8,
+               error.InvalidIPv4Length);
+        transition parse_l4;
     }
     state parse_l4 {
         packet.extract(hdr.l4);
@@ -115,6 +154,10 @@ control MyIngress(inout headers hdr,
     }
 
     apply {
+        if (standard_metadata.parser_error != error.NoError) {
+            drop();
+            return;
+        }
         if (hdr.ethernet.isValid()) {
             dmac.apply();
         }
@@ -134,6 +177,7 @@ control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
+        packet.emit(hdr.options);
         packet.emit(hdr.l4);
     }
 }
