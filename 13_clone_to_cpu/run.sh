@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Case 13: clone to CPU.
+# sudo ./run.sh checks original frames and matching CPU copies in both directions.
 set -euo pipefail
 CASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${CASE_DIR}/.." && pwd)"

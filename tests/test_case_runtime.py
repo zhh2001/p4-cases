@@ -56,7 +56,7 @@ class CaseRuntimeTests(unittest.TestCase):
         controller = self.controller("import time; time.sleep(60)")
         started = time.monotonic()
         load_case(5).drain_controller(controller, 0.1)
-        self.assertEqual(load_case(13).count_packet_ins(controller, 0.1), 0)
+        self.assertEqual(load_case(13).packet_ins(controller, "unused", 0.1), [])
         self.assertLess(time.monotonic() - started, 0.7)
 
     def test_counter_and_register_controllers_keep_stdin_open(self):

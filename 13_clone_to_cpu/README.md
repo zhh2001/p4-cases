@@ -1,91 +1,127 @@
-# 🐛 Case 13 · 克隆到 CPU(pre.CloneSession + PacketIn)
+# Case 13：克隆到 CPU
 
-> **学习目标**: 用 **P4Runtime CloneSession** 把数据面的每个包拷贝一份送给控制器。BMv2 的 `simple_switch_grpc` 支持 `--cpu-port`,CPU 端口出的包会作为 `PacketIn` 流消息送到 gRPC stream。SDK 的 `client.OnPacketIn` 直接对接。
+本案例将 `h1` 和 `h2` 之间的报文正常转发，同时复制一份发送到 CPU 端口。BMv2 将 CPU 端口的报文送入 P4Runtime 的 `PacketIn` 通道，控制器通过 `OnPacketIn` 接收。
 
-## Pipeline
+拓扑使用交换机端口 1 和 2 连接主机，CPU 端口为 510，clone session ID 为 99。
+
+## 数据面
+
+入方向记录原始入端口，并将原包从另一主机端口发出。随后调用 `clone_preserving_field_list`，生成发往 clone session 99 的副本。
 
 ```p4
-const bit<32> CPU_CLONE_SESSION_ID = 99;
-
-apply {
-    meta.ingress_port = standard_metadata.ingress_port;   // 存到 meta
-    cross_forward();                                       // 正常 1<->2 转发
-
-    // 克隆一份给 CPU session 99;控制器把 session 的 replica 设成 cpu_port
-    clone_preserving_field_list(CloneType.I2E, CPU_CLONE_SESSION_ID, 0);
-}
+meta.ingress_port = standard_metadata.ingress_port;
+clone_preserving_field_list(CloneType.I2E, CPU_CLONE_SESSION_ID, 0);
 ```
 
-egress 阶段识别"这是我刚 clone 出来的副本"(`instance_type == 1`),给它打上 `cpu_t` 头:
+`meta.ingress_port` 使用 `@field_list(0)` 标注，使它保留到副本的出方向处理阶段。
+
+出方向通过 `instance_type == 1` 识别 I2E 副本，并加入 CPU 头。原包继续沿正常转发路径发送。
 
 ```p4
 if (standard_metadata.instance_type == 1) {
     hdr.cpu.setValid();
-    hdr.cpu.ingress_port   = (bit<16>)meta.ingress_port;
-    hdr.ethernet.etherType = ETHERTYPE_CPU;  // 0x1010
+    hdr.cpu.ingress_port = (bit<16>)meta.ingress_port;
+    hdr.ethernet.etherType = ETHERTYPE_CPU;
 }
 ```
 
-## 控制器做两件事
+控制器收到的副本格式如下：
+
+| 字节位置  | 内容                       |
+| --------- | -------------------------- |
+| 0 到 5    | 原包的目的 MAC             |
+| 6 到 11   | 原包的源 MAC               |
+| 12 到 13  | EtherType `0x1010`         |
+| 14 到 15  | 原始入端口，使用网络字节序 |
+| 16 及以后 | 原包的以太网负载           |
+
+原包的 EtherType 会被替换，副本不保留这个字段的原值。测试发送的原包使用 EtherType `0x88b5`。
+
+## 控制器
+
+控制器安装流水线后，将 clone session 99 的副本端口配置为 510，然后注册 PacketIn 回调。
 
 ```go
-// 1) 告诉交换机:session 99 的复制品送到 cpu port (510)
 preW.InsertCloneSession(ctx, pre.CloneSession{
     ID:       99,
     Replicas: []pre.Replica{{EgressPort: 510}},
 })
-
-// 2) 订阅 PacketIn
-c.OnPacketIn(func(_ context.Context, msg *p4v1.PacketIn) {
-    payload := msg.GetPayload()
-    ethType := binary.BigEndian.Uint16(payload[12:14])
-    ingressPort := binary.BigEndian.Uint16(payload[14:16])
-    fmt.Printf("packet-in ... ingress_port=%d\n", ingressPort)
-})
 ```
 
-## 与 Case 05 (Digest) 的对比
+回调检查报文长度、CPU EtherType 和入端口。当前拓扑只接受入端口 1 和 2。通过检查后才增加有效 PacketIn 数量，并输出完整报文的十六进制内容。
 
-| | Clone-to-CPU(本例) | Digest(Case 05) |
-| --- | --- | --- |
-| 通道 | **整包**通过 CPU 端口传 | 单条结构体(几个字段)通过 digest 通道传 |
-| 代价 | 整包复制,流量大 | 只发摘要,轻量 |
-| 用途 | 需要完整包内容做进一步处理(IDS、sFlow、复杂 ACL 学习) | 只需要字段值(MAC 学习、事件告警) |
-| BMv2 操作码 | `clone_preserving_field_list(I2E, session_id, field_list_id)` + egress 改包 | `digest<T>(receiver, value)` |
-| SDK API | `pre.Writer.InsertCloneSession` + `client.OnPacketIn` | `digest.NewSubscriber(...).OnDigest(...)` |
+完整负载用于关联测试报文。只输出前几个字节无法核对唯一标识、序号和负载是否保留。
 
-## 运行
+## 文件
+
+| 文件                      | 作用                                    |
+| ------------------------- | --------------------------------------- |
+| `main.p4`                 | 原包转发、I2E clone 和 CPU 头生成       |
+| `controller/main.go`      | 配置 clone session，解析并输出 PacketIn |
+| `controller/main_test.go` | 检查短报文、EtherType 和入端口解析      |
+| `topology.py`             | 创建拓扑，验证双向转发和对应副本        |
+| `test.py`                 | 在主机内发送和捕获带唯一标识的测试报文  |
+| `run.sh`                  | 编译、启动和运行自动测试                |
+
+## 运行和验证
 
 ```bash
+cd 13_clone_to_cpu
 sudo ./run.sh
 ```
 
-## 预期输出
+报文收发使用 Python 原始套接字，需要 root 权限，不需要 Scapy。其他依赖与公共运行模块相同。
 
+测试分别检查 `h1 → h2` 和 `h2 → h1`，每个方向发送 10 个报文。每轮都有新的随机标识，每个报文也有不同的序号。
+
+通过条件包括：
+
+1. 发送进程成功退出，确认发送了 10 个不同的报文。
+2. 目标主机收到每个原包一次，MAC、EtherType 和完整负载与发送内容一致。
+3. 控制器收到每个测试报文的副本一次，MAC 和负载保持一致。
+4. 副本的 CPU EtherType 为 `0x1010`，CPU 头和日志中的入端口均与发送主机一致。
+5. 测试期间控制器保持运行。
+
+捕获进程会先确认套接字已准备好，随后才启动发送。子进程错误、超时、缺包、重复副本或错误入端口都会使测试失败。退出时回收本轮收发进程。
+
+控制器也会收到 ARP、IPv6 等后台报文。自动测试只核对带本轮标识的报文，不使用所有 PacketIn 的累计数量作为通过条件。
+
+关键输出如下：
+
+```text
+controller: clone session 99 -> cpu port 510 installed
+controller: clone-to-cpu ready
+h1 -> h2: sent=10, forwarded=10, cloned=10, ingress_port=1
+h2 -> h1: sent=10, forwarded=10, cloned=10, ingress_port=2
+SUCCESS: every test frame was forwarded and cloned with its ingress port
 ```
-    controller: clone session 99 -> cpu port 510 installed
-    controller: clone-to-cpu ready
-*** h1 sending 10 frames to h2
-    controller: packet-in #1  ingress_port=1 payload=...
-    controller: packet-in #2  ingress_port=1 payload=...
-    ...
-packet-in arrivals: 20 (expected >= 10)
-SUCCESS: every data-plane packet was cloned to the controller
+
+控制器的逐包日志可能穿插其中。退出时显示的有效 PacketIn 总数包含后台流量，可以大于 20。
+
+进入交互模式：
+
+```bash
+sudo ./run.sh cli
 ```
 
-arrivals 通常**大于**注入数量,因为 mininet host 自己会发 IPv6 RA / ARP 等背景流量,这些也走 clone 路径。**测试只要 ≥ 我们注入的 10 就算过**。
+无需启动交换机的回归测试在仓库根目录运行：
 
-## 故障排查
+```bash
+go test ./13_clone_to_cpu/controller
+python3 -m unittest discover -s tests -p test_clone_to_cpu.py -v
+```
 
-**0 packet-ins**:  
-- 检查 `P4RuntimeSwitch` 启动时传了 `cpu_port=510` 给 `simple_switch_grpc --cpu-port 510`。
-- 检查 CloneSession insert 是否成功。BMv2 的 `pre.CloneSessionEntry` 要求 replica 是 CPU port 编号(对 simple_switch_grpc 是 `--cpu-port` 指定的那个)。
+## 与 Case 05 的区别
 
-**packet-in 有但 ethType 不是 0x1010**:  
-egress 的 `instance_type == 1` 没触发。检查 `clone_preserving_field_list` 调用是否在 ingress 的 apply 里。
+| 项目       | 本案例                       | Case 05                    |
+| ---------- | ---------------------------- | -------------------------- |
+| 通知内容   | 带 CPU 头的报文副本          | MAC 和入端口组成的学习事件 |
+| 用途       | 检查报文内容或送往控制面处理 | 学习 MAC 并写入转发表      |
+| 交换机配置 | clone session 和 CPU 端口    | `DigestEntry`              |
+| 控制器接收 | `OnPacketIn`                 | `OnDigest`                 |
 
-## 延伸
+## 排查和延伸
 
-- **反向(CPU 主动注入包)**: 使用 `client.SendPacketOut` 把整包从控制器送回 BMv2 的特定 egress port(如正好做一个"从 CPU 插入 ARP Reply"的把戏)。
-- **过滤**: 不对所有包 clone,只对 ACL 命中的某一类;把 `clone_preserving_field_list` 放到 table action 里而不是 apply 末尾。
-- **与 digest 组合**: 先让 smac 未知的包 digest 通知"有新 MAC",控制器决定感兴趣了再下个表条目让后续同源包 clone 到 CPU 看详情。
+没有对应副本时，先检查 BMv2 启动参数中的 `--cpu-port 510`，以及控制器是否成功安装 clone session 99。若报文到达控制器但解析失败，再检查出方向是否生成了 CPU 头，以及 `@field_list(0)` 是否保留了入端口。
+
+本案例复制所有从主机端口进入的报文。后续可以将 clone 放入表动作，只复制满足指定条件的流量。CPU 主动发送报文属于 PacketOut 路径，需要另外设计相应的处理逻辑。

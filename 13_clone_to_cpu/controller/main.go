@@ -4,14 +4,15 @@
 // BMv2 CPU port (510), then registers an OnPacketIn handler. Every
 // packet the switch handles gets cloned; the egress pipeline stamps a
 // cpu header (ethType=0x1010, next 16 bits = ingress_port). The
-// controller counts arrivals and echoes each one to stdout so the
-// topology driver can verify.
+// controller validates each CPU header and prints the complete packet
+// so the topology driver can correlate test frames with their copies.
 package main
 
 import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -29,10 +30,10 @@ import (
 )
 
 const (
-	cpuPort          = 510
-	cloneSessionID   = 99
-	expectedEthType  = 0x1010
-	cpuHeaderLen     = 2  // our cpu_t is 16 bits
+	cpuPort         = 510
+	cloneSessionID  = 99
+	expectedEthType = 0x1010
+	cpuHeaderLen    = 2 // our cpu_t is 16 bits
 )
 
 func main() {
@@ -101,24 +102,33 @@ func main() {
 	var received int64
 	c.OnPacketIn(func(_ context.Context, msg *p4v1.PacketIn) {
 		payload := msg.GetPayload()
+		ingressPort, err := decodePacketIn(payload)
+		if err != nil {
+			log.Printf("invalid packet-in: %v", err)
+			return
+		}
 		n := atomic.AddInt64(&received, 1)
-		// Parse: 14 bytes outer ether, 2 bytes cpu (ingress_port).
-		if len(payload) < 14+cpuHeaderLen {
-			log.Printf("#%d: short packet-in (%d bytes)", n, len(payload))
-			return
-		}
-		ethType := binary.BigEndian.Uint16(payload[12:14])
-		if ethType != expectedEthType {
-			log.Printf("#%d: unexpected ethType 0x%04x (want 0x%04x)", n, ethType, expectedEthType)
-			return
-		}
-		ingressPort := binary.BigEndian.Uint16(payload[14:16])
 		fmt.Printf("packet-in #%d ingress_port=%d payload=%s\n", n, ingressPort,
-			hex.EncodeToString(payload[:min(24, len(payload))]))
+			hex.EncodeToString(payload))
 	})
 
 	fmt.Println("clone-to-cpu ready")
 
 	<-ctx.Done()
-	log.Printf("shutting down; received %d packet-ins", atomic.LoadInt64(&received))
+	log.Printf("shutting down, received %d valid packet-ins", atomic.LoadInt64(&received))
+}
+
+func decodePacketIn(payload []byte) (uint16, error) {
+	// Parse the Ethernet header and the two-byte CPU ingress port.
+	if len(payload) < 14+cpuHeaderLen {
+		return 0, fmt.Errorf("short payload (%d bytes)", len(payload))
+	}
+	if binary.BigEndian.Uint16(payload[12:14]) != expectedEthType {
+		return 0, errors.New("EtherType must be 0x1010")
+	}
+	port := binary.BigEndian.Uint16(payload[14:16])
+	if port != 1 && port != 2 {
+		return 0, fmt.Errorf("unexpected ingress port %d", port)
+	}
+	return port, nil
 }

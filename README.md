@@ -98,7 +98,7 @@ p4-cases/
 - `client.Dial` + `BecomePrimary` 处理 gRPC + 仲裁
 - `pipeline.LoadText` + `client.SetPipeline` 推 P4Info + bmv2.json
 - `tableentry.Builder` 写表，`codec.MustMAC/MustIPv4/MustEncodeUint` 做规范字节编码
-- `pre.Writer` 管 MulticastGroup / CloneSession(本仓库 Case 04/05 用到)
+- `pre.Writer` 管 MulticastGroup / CloneSession(本仓库 Case 04/05/13 用到)
 - `digest.NewSubscriber` 订阅 digest 事件(Case 05)
 - `counter.NewReader` / `meter.NewReader` 读/写 counter、meter(Case 07/08)
 
@@ -121,7 +121,7 @@ p4-cases/
 | 10      | 4 条流的 allow/deny 结果与规则优先级一致                                                                            |
 | 11      | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对                                                                          |
 | 12      | Thrift 读出 register 某 slot = 注入包数                                                                             |
-| 13      | 控制器 `OnPacketIn` 收到的 clone 数 ≥ 注入包数                                                                      |
+| 13      | 双向各发送 10 帧，逐包核对主机收到的原包和控制器收到的副本，并检查 CPU 头中的入端口                                 |
 | 14      | 4 条 IPv6 流：`/64` 命中、`/128` 长前缀覆盖、回退到 `/64`、无路由的流被 drop。同时校验 `hopLimit-1` 和 dst-MAC 重写 |
 
 不想跑测试、只想进 mininet CLI 手动玩：`sudo ./run.sh cli`。
