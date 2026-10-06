@@ -6,8 +6,8 @@
  * Ethernet frame addressed to an inner MAC 00:00:00:11:11:11. The
  * ingress vtep table matches on that inner MAC and wraps the whole
  * frame in Outer-Eth / Outer-IP / UDP / VXLAN(VNI=5000) headers
- * before forwarding it to h2's port. h2 receives the wrapped packet,
- * scapy confirms the VXLAN header, VNI, and inner destination MAC.
+ * before forwarding it to h2's port. Tests verify the complete
+ * outer stack and preservation of the original frame.
  */
 
 #include <core.p4>
@@ -16,6 +16,7 @@
 const bit<16> TYPE_IPV4  = 0x0800;
 const bit<8>  PROTO_UDP  = 17;
 const bit<16> VXLAN_PORT = 4789;
+const bit<32> MAX_INNER_FRAME = 65499;  // IPv4 limit minus IP / UDP / VXLAN
 
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
@@ -91,6 +92,10 @@ control MyIngress(inout headers hdr,
                  ip4Addr_t outer_sip,
                  ip4Addr_t outer_dip,
                  bit<24>   vni) {
+        if (standard_metadata.packet_length > MAX_INNER_FRAME) {
+            drop();
+            return;
+        }
         standard_metadata.egress_spec = egress_port;
 
         hdr.outer_eth.setValid();
@@ -102,7 +107,7 @@ control MyIngress(inout headers hdr,
         hdr.outer_ipv4.version        = 4;
         hdr.outer_ipv4.ihl            = 5;
         hdr.outer_ipv4.diffserv       = 0;
-        hdr.outer_ipv4.totalLen       = 50;   // 20+8+8 + 14 inner eth
+        hdr.outer_ipv4.totalLen       = (bit<16>)(standard_metadata.packet_length + 36);
         hdr.outer_ipv4.identification = 0;
         hdr.outer_ipv4.flags          = 0;
         hdr.outer_ipv4.fragOffset     = 0;
@@ -115,7 +120,7 @@ control MyIngress(inout headers hdr,
         hdr.outer_udp.setValid();
         hdr.outer_udp.srcPort  = 12345;
         hdr.outer_udp.dstPort  = VXLAN_PORT;
-        hdr.outer_udp.length_  = 30;  // 8+8 + 14 inner eth
+        hdr.outer_udp.length_  = (bit<16>)(standard_metadata.packet_length + 16);
         hdr.outer_udp.checksum = 0;
 
         hdr.vxlan.setValid();
@@ -133,10 +138,14 @@ control MyIngress(inout headers hdr,
         key     = { hdr.inner_eth.dstAddr: exact; }
         actions = { encap; forward_plain; drop; NoAction; }
         size    = 256;
-        default_action = NoAction;
+        default_action = drop;
     }
 
     apply {
+        if (standard_metadata.parser_error != error.NoError) {
+            drop();
+            return;
+        }
         vtep.apply();
     }
 }

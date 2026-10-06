@@ -32,7 +32,7 @@
 | [08](08_counter/)               | Counter           | **Counter extern / 读取累积值**        | `CounterEntry` 读出包数 / 字节数                 |
 | [09](09_ecmp_hash/)             | ECMP 多路径       | **5-tuple hash + ecmp group**          | direct /32 + /24 ECMP + `ecmp_nhop` 2 个成员     |
 | [10](10_firewall_acl/)          | 防火墙 ACL        | **TERNARY 表 + priority**              | 3 条不同优先级的 allow/deny 规则                 |
-| [11](11_vxlan_encap/)           | VXLAN 封装        | **头部插入 / `setValid()`**            | 一条 vtep 表，外层头全参数化                     |
+| [11](11_vxlan_encap/)           | VXLAN 封装        | **头部插入 / `setValid()`**            | 一条 vtep 表，配置出口、外层地址与 VNI           |
 | [12](12_register_flow_counter/) | Register 逐流统计 | **register + hash(5-tuple)**           | 纯数据面维护，控制器通过 Thrift 读回             |
 | [13](13_clone_to_cpu/)          | 克隆到 CPU        | **CloneSession + PacketIn**            | 每包 clone 到 CPU port，控制器 `OnPacketIn` 收包 |
 | [14](14_ipv6_lpm/)              | IPv6 LPM 路由     | **128 位 LPM + L3 重写 + hopLimit**    | 4 条路由(/64×3 + /128×1)，演示长前缀优先         |
@@ -119,7 +119,7 @@ p4-cases/
 | 08      | port 1 counter 增量 ≥ 我们注入的包数                                                                                |
 | 09      | h2 和 h3 均收到 >0 的 ECMP 分发流量                                                                                 |
 | 10      | 按 IHL 读取端口，核对双向正常和 Options 流量，丢弃 IPv4 分片及所检查的格式异常报文                                  |
-| 11      | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对                                                                          |
+| 11      | 按入包长度生成 VXLAN 外层头，逐字节核对完整封装帧，并检查未匹配流量的丢弃                                           |
 | 12      | Thrift 读出 register 某 slot = 注入包数                                                                             |
 | 13      | 双向各发送 10 帧，逐包核对主机收到的原包和控制器收到的副本，并检查 CPU 头中的入端口                                 |
 | 14      | 4 条 IPv6 流：`/64` 命中、`/128` 长前缀覆盖、回退到 `/64`、无路由的流被 drop。同时校验 `hopLimit-1` 和 dst-MAC 重写 |

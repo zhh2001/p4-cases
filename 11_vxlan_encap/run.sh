@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Case 11: VXLAN encap.
+# Tests compare complete encapsulated frames across several inner lengths.
 set -euo pipefail
 CASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${CASE_DIR}/.." && pwd)"

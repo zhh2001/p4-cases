@@ -1,34 +1,70 @@
 #!/usr/bin/env python3
-"""Runs inside h2. Waits for a VXLAN-over-UDP packet and prints a
-machine-readable line `vni=<N> inner_dst=<MAC>` plus a plain count on
-stdout so the driver can tell whether we saw anything.
-"""
+"""Send frame manifests and capture test traffic without decoding it."""
+
 from __future__ import annotations
 
-from scapy.all import AsyncSniffer, UDP
+import argparse
+import json
+from pathlib import Path
+import socket
+import time
 
-IFACE = "h2-eth0"
-TIMEOUT = 4.0
+
+OUTER_SOURCE = bytes.fromhex("000000dead01")
 
 
-def main() -> int:
-    s = AsyncSniffer(
-        iface=IFACE, count=1, timeout=TIMEOUT,
-        lfilter=lambda p: UDP in p and p[UDP].dport == 4789,
-    )
-    s.start()
-    s.join()
-    pkts = s.results or []
-    print(len(pkts))
-    if not pkts:
-        return 1
-    raw = bytes(pkts[0])
-    vxlan_off = 14 + 20 + 8     # outer eth + ipv4 + udp
-    vni = int.from_bytes(raw[vxlan_off + 4 : vxlan_off + 7], "big")
-    inner_dst = ":".join(f"{b:02x}" for b in raw[vxlan_off + 8 : vxlan_off + 14])
-    print(f"vni={vni} inner_dst={inner_dst}")
-    return 0
+def send_frames(iface: str, filename: str) -> None:
+    frames = [bytes.fromhex(frame) for frame in json.loads(Path(filename).read_text())]
+    if not frames or any(len(frame) < 14 for frame in frames):
+        raise ValueError("manifest must contain Ethernet frames")
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as sock:
+        sock.bind((iface, 0))
+        for frame in frames:
+            if sock.send(frame) != len(frame):
+                raise RuntimeError("incomplete Ethernet frame send")
+            time.sleep(0.005)
+    print(json.dumps({"sent": len(frames)}), flush=True)
+
+
+def receive_frames(iface: str, prefix: str, seconds: float, ready: str) -> None:
+    marker = bytes.fromhex(prefix)
+    if len(marker) != 4:
+        raise ValueError("capture prefix must contain four MAC bytes")
+    frames = []
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as sock:
+        sock.bind((iface, 0))
+        Path(ready).write_text("ready\n")
+        deadline = time.monotonic() + seconds
+        while (remaining := deadline - time.monotonic()) > 0:
+            sock.settimeout(remaining)
+            try:
+                frame, address = sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            if address[2] != socket.PACKET_OUTGOING and (
+                frame[6:10] == marker or frame[6:12] == OUTER_SOURCE
+            ):
+                frames.append(frame.hex())
+    print(json.dumps({"frames": frames}), flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    send = commands.add_parser("send")
+    send.add_argument("--iface", required=True)
+    send.add_argument("--frames", required=True)
+    receive = commands.add_parser("receive")
+    receive.add_argument("--iface", required=True)
+    receive.add_argument("--prefix", required=True)
+    receive.add_argument("--seconds", type=float, default=3)
+    receive.add_argument("--ready", required=True)
+    args = parser.parse_args()
+    if args.command == "send":
+        send_frames(args.iface, args.frames)
+    else:
+        receive_frames(args.iface, args.prefix, args.seconds, args.ready)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
