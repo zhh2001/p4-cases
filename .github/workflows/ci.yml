@@ -8,9 +8,9 @@ name: ci
 #
 # What CI catches:
 #   * P4 source compile errors.
-#   * Go controller source compile errors / tidy drift.
+#   * Go controller source compile errors, tests and tidy drift.
 #   * run.sh / run_helpers.sh lint regressions.
-#   * Python syntax and shared runtime lifecycle tests.
+#   * Python syntax, runtime lifecycle and learning validation tests.
 
 on:
   push:
@@ -89,6 +89,8 @@ jobs:
           git diff --exit-code go.mod go.sum
       - name: go vet
         run: go vet ./...
+      - name: go test
+        run: go test ./...
       - name: go build every controller
         shell: bash
         run: |

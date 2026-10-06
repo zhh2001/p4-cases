@@ -26,7 +26,7 @@
 | [02](02_repeater/)              | Port Repeater     | 硬编码 `if-else` vs 查找表             | 只推 pipeline                                    |
 | [03](03_l2_forwarding_switch/)  | L2 静态转发       | EXACT 表 + action 参数                 | 写 4 条 `dmac` 表项                              |
 | [04](04_l2_broadcast_switch/)   | L2 广播交换机     | **PRE / MulticastGroup**               | 上面 + 4 个 mcast 组 + `select_mcast_grp` 表项   |
-| [05](05_l2_learning_switch/)    | L2 学习交换机     | **Digest** (数据面→控制面通知)         | 订阅 digest，动态回填 `smac`/`dmac`              |
+| [05](05_l2_learning_switch/)    | L2 学习交换机     | **Digest** (数据面→控制面通知)         | 启用并订阅 digest，动态写入 `smac`/`dmac`        |
 | [06](06_int/)                   | 带内网络遥测      | **多交换机 + IPv4 Options + 逐跳遥测** | 并行 3 个控制器，各装 LPM + `int_table` 默认动作 |
 | [07](07_meter/)                 | Meter             | **Meter extern / 三色标记**            | `MeterEntry` 配 CIR/PIR，drop 非绿流量           |
 | [08](08_counter/)               | Counter           | **Counter extern / 读取累积值**        | `CounterEntry` 读出包数 / 字节数                 |
@@ -77,7 +77,7 @@ p4-cases/
 │   ├── p4switch.py              # Mininet Switch 子类，拉起 simple_switch_grpc
 │   ├── runtime.py               # 控制器日志读取、超时和网络清理
 │   └── run_helpers.sh           # 每个案例 run.sh 共享的工具函数
-├── tests/                      # 公共运行逻辑的回归测试
+├── tests/                      # 公共运行逻辑和案例的回归测试
 ├── 01_packet_reflector/
 │   ├── main.p4
 │   ├── topology.py
@@ -102,26 +102,27 @@ p4-cases/
 - `digest.NewSubscriber` 订阅 digest 事件(Case 05)
 - `counter.NewReader` / `meter.NewReader` 读/写 counter、meter(Case 07/08)
 
-版本 v1.1.0 起，PRE 被正式纳入 API。每个案例的 `controller/main.go` 只有 50-150 行，重点演示**如何调用 SDK**，而不是堆胶水代码。
+版本 v1.1.0 起，PRE 被正式纳入 API。各案例的 `controller/main.go` 演示 SDK 的调用方式，并处理相应的控制面逻辑。
 
 ## 🧪 自动化验证
 
 每个 `run.sh` 的 `sudo ./run.sh` 模式都内置了端到端检查：
 
-| 案例         | 判定方式                                                                                                            |
-| ------------ | ------------------------------------------------------------------------------------------------------------------- |
-| 01           | scapy 在 h1 上捕获 MAC 已对调的回包                                                                                 |
-| 02           | h1 发、h2 收(scapy sniff)                                                                                           |
-| 03 / 04 / 05 | Mininet `pingAll`，期望 0% 丢包                                                                                     |
-| 06           | h2 的 INT 栈包含 `swid ∈ {1,2}` 至少 2 条                                                                           |
-| 07           | metered 源的通过率 明显 < 非 metered 源                                                                             |
-| 08           | port 1 counter 增量 ≥ 我们注入的包数                                                                                |
-| 09           | h2 和 h3 均收到 >0 的 ECMP 分发流量                                                                                 |
-| 10           | 4 条流的 allow/deny 结果与规则优先级一致                                                                            |
-| 11           | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对                                                                          |
-| 12           | Thrift 读出 register 某 slot = 注入包数                                                                             |
-| 13           | 控制器 `OnPacketIn` 收到的 clone 数 ≥ 注入包数                                                                      |
-| 14           | 4 条 IPv6 流：`/64` 命中、`/128` 长前缀覆盖、回退到 `/64`、无路由的流被 drop。同时校验 `hopLimit-1` 和 dst-MAC 重写 |
+| 案例    | 判定方式                                                                                                            |
+| ------- | ------------------------------------------------------------------------------------------------------------------- |
+| 01      | scapy 在 h1 上捕获 MAC 已对调的回包                                                                                 |
+| 02      | h1 发、h2 收(scapy sniff)                                                                                           |
+| 03 / 04 | Mininet `pingAll`，期望 0% 丢包                                                                                     |
+| 05      | 读回两张 MAC 表并核对端口，两轮 `pingAll` 零丢包，逐主机捕获报文验证泛洪和学习后的单播                              |
+| 06      | h2 的 INT 栈包含 `swid ∈ {1,2}` 至少 2 条                                                                           |
+| 07      | metered 源的通过率 明显 < 非 metered 源                                                                             |
+| 08      | port 1 counter 增量 ≥ 我们注入的包数                                                                                |
+| 09      | h2 和 h3 均收到 >0 的 ECMP 分发流量                                                                                 |
+| 10      | 4 条流的 allow/deny 结果与规则优先级一致                                                                            |
+| 11      | h2 抓到 VXLAN 包 `VNI=5000` + inner MAC 对                                                                          |
+| 12      | Thrift 读出 register 某 slot = 注入包数                                                                             |
+| 13      | 控制器 `OnPacketIn` 收到的 clone 数 ≥ 注入包数                                                                      |
+| 14      | 4 条 IPv6 流：`/64` 命中、`/128` 长前缀覆盖、回退到 `/64`、无路由的流被 drop。同时校验 `hopLimit-1` 和 dst-MAC 重写 |
 
 不想跑测试、只想进 mininet CLI 手动玩：`sudo ./run.sh cli`。
 
@@ -140,7 +141,7 @@ p4-cases/
 绝大多数是静态 ARP 没注入(Case 03)或多播组缺配(Case 04)。看控制器日志应该能看到哪条表项未写成功。
 
 **scapy 版本太老**  
-Case 02+ 的测试依赖 `AsyncSniffer`(scapy ≥ 2.4.5)。`sudo pip3 install --upgrade --break-system-packages scapy`。
+部分案例的测试依赖 `AsyncSniffer`(scapy ≥ 2.4.5)。`sudo pip3 install --upgrade --break-system-packages scapy`。
 
 ## 🗺️ 路线图
 

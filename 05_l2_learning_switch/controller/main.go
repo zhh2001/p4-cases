@@ -2,29 +2,28 @@
 //
 // Flow:
 //
-//   1. Push the pipeline.
-//   2. Install multicast groups 1..N and broadcast table entries so
-//      frames with unknown destinations flood to every port except
-//      the ingress.
-//   3. Subscribe to the `learn_t` digest. Every time BMv2 sees a
-//      source MAC it has not seen before, it fires a digest carrying
-//      (srcAddr, ingress_port). The controller installs matching
-//      smac (source seen) + dmac (where to forward) entries so the
-//      next frame reuses them instead of re-triggering the digest
-//      and/or flooding.
-//   4. Sleep until SIGTERM.
+//  1. Push the pipeline.
+//  2. Install multicast groups 1..N and broadcast table entries so
+//     frames with unknown destinations flood to every port except
+//     the ingress.
+//  3. Enable and subscribe to the `learn_t` digest. Every time BMv2 sees a
+//     source MAC it has not seen before, it fires a digest carrying
+//     (srcAddr, ingress_port). The controller installs matching
+//     smac (source seen) + dmac (where to forward) entries so the
+//     next frame reuses them instead of re-triggering the digest
+//     and/or flooding.
+//  4. Process digest lists until SIGTERM.
 package main
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -33,9 +32,12 @@ import (
 	"github.com/zhh2001/p4runtime-go-controller/client"
 	"github.com/zhh2001/p4runtime-go-controller/codec"
 	"github.com/zhh2001/p4runtime-go-controller/digest"
+	sdkerrors "github.com/zhh2001/p4runtime-go-controller/errors"
 	"github.com/zhh2001/p4runtime-go-controller/pipeline"
 	"github.com/zhh2001/p4runtime-go-controller/pre"
 	"github.com/zhh2001/p4runtime-go-controller/tableentry"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -49,6 +51,9 @@ func main() {
 	flag.Parse()
 	if *p4info == "" || *config == "" {
 		log.Fatal("-p4info and -config are required")
+	}
+	if *ports < 2 || *ports > 254 {
+		log.Fatal("-ports must be between 2 and 254")
 	}
 
 	infoBytes, err := os.ReadFile(*p4info)
@@ -127,96 +132,137 @@ func main() {
 	}
 	log.Printf("installed %d broadcast table entries", *ports)
 
-	// Subscribe to the digest stream.
+	// Register the callback before enabling notifications on the switch.
 	digestSub, err := digest.NewSubscriber(c, p)
 	if err != nil {
 		log.Fatalf("digest subscriber: %v", err)
 	}
 
-	// Track already-learned MACs so repeated digests for the same MAC
-	// don't try to double-insert.
-	var learnedMu sync.Mutex
-	learned := map[string]uint32{}
-
-	digestSub.OnDigest("learn_t", func(ctx context.Context, msg *p4v1.DigestList) {
-		for _, member := range msg.GetData() {
-			srcMAC, ingressPort, ok := decodeLearnStruct(member)
-			if !ok {
-				log.Printf("digest: could not decode learn_t payload: %v", member)
-				continue
-			}
-			key := hex.EncodeToString(srcMAC)
-			learnedMu.Lock()
-			if existing, seen := learned[key]; seen && existing == ingressPort {
-				learnedMu.Unlock()
-				continue
-			}
-			learned[key] = ingressPort
-			learnedMu.Unlock()
-			installLearned(ctx, c, p, srcMAC, ingressPort)
-		}
-		if err := digestSub.Ack(ctx, msg); err != nil {
-			log.Printf("digest ack: %v", err)
+	pending := make(chan *p4v1.DigestList, 256)
+	unsubscribe := digestSub.OnDigest("learn_t", func(_ context.Context, msg *p4v1.DigestList) {
+		select {
+		case pending <- msg:
+		case <-ctx.Done():
+		default:
+			log.Printf("digest queue full, skipped list %d", msg.GetListId())
 		}
 	})
+	defer unsubscribe()
+	if err := enableDigest(ctx, c, p); err != nil {
+		log.Fatalf("enable learn_t: %v", err)
+	}
+	learner := macLearner{writer: c, pipeline: p, ports: uint32(*ports), learned: map[string]uint32{}}
 	fmt.Printf("learning-switch ready: %d ports, flooding unknown destinations\n", *ports)
 
-	<-ctx.Done()
-	log.Println("shutting down")
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("shutting down")
+			return
+		case msg := <-pending:
+			learnCtx, learnCancel := context.WithTimeout(ctx, 2*time.Second)
+			for _, member := range msg.GetData() {
+				mac, port, ok := decodeLearnStruct(member)
+				if !ok {
+					log.Printf("digest: invalid learn_t payload: %v", member)
+					continue
+				}
+				if err := learner.learn(learnCtx, mac, port); err != nil {
+					log.Printf("learn %s: %v", codec.FormatHex(mac), err)
+				}
+			}
+			if err := digestSub.Ack(learnCtx, msg); err != nil {
+				log.Printf("digest ack: %v", err)
+			}
+			learnCancel()
+		}
+	}
+}
+
+type runtimeWriter interface {
+	Write(context.Context, client.WriteOptions, ...*p4v1.Update) error
+}
+
+func enableDigest(ctx context.Context, c runtimeWriter, p *pipeline.Pipeline) error {
+	definition, ok := p.Digest("learn_t")
+	if !ok {
+		return errors.New("learn_t is missing from P4Info")
+	}
+	return c.Write(ctx, client.WriteOptions{}, &p4v1.Update{
+		Type: p4v1.Update_INSERT,
+		Entity: &p4v1.Entity{Entity: &p4v1.Entity_DigestEntry{DigestEntry: &p4v1.DigestEntry{
+			DigestId: definition.ID,
+			Config: &p4v1.DigestEntry_Config{
+				MaxTimeoutNs: 0,
+				MaxListSize:  1,
+				AckTimeoutNs: int64(time.Second),
+			},
+		}}},
+	})
 }
 
 // decodeLearnStruct unpacks a digest payload carrying:
-//   struct learn_t { macAddr_t srcAddr; port_t ingress_port; }
+//
+//	struct learn_t { macAddr_t srcAddr; port_t ingress_port; }
 func decodeLearnStruct(d *p4v1.P4Data) (mac []byte, port uint32, ok bool) {
 	sl := d.GetStruct()
-	if sl == nil || len(sl.GetMembers()) < 2 {
+	if sl == nil || len(sl.GetMembers()) != 2 {
 		return nil, 0, false
 	}
 	macBytes := sl.GetMembers()[0].GetBitstring()
 	portBytes := sl.GetMembers()[1].GetBitstring()
-	if len(macBytes) == 0 || len(portBytes) == 0 {
+	if len(macBytes) == 0 || len(macBytes) > 6 || len(portBytes) == 0 || len(portBytes) > 2 {
 		return nil, 0, false
 	}
-	mac = padLeft(macBytes, 6)
-	port = uint32(decodeBig(portBytes))
-	_ = binary.BigEndian
-	return mac, port, true
-}
-
-func decodeBig(b []byte) uint64 {
-	var v uint64
-	for _, x := range b {
-		v = (v << 8) | uint64(x)
+	mac = make([]byte, 6)
+	copy(mac[6-len(macBytes):], macBytes)
+	for _, value := range portBytes {
+		port = (port << 8) | uint32(value)
 	}
-	return v
+	return mac, port, port > 0 && port < 512
 }
 
-func padLeft(b []byte, width int) []byte {
-	if len(b) >= width {
-		return b
+type tableWriter interface {
+	WriteTableEntry(context.Context, client.UpdateType, *p4v1.TableEntry) error
+}
+
+type macLearner struct {
+	writer   tableWriter
+	pipeline *pipeline.Pipeline
+	ports    uint32
+	learned  map[string]uint32
+}
+
+func (l *macLearner) learn(ctx context.Context, mac []byte, port uint32) error {
+	if len(mac) != 6 || mac[0]&1 != 0 || hex.EncodeToString(mac) == "000000000000" {
+		return errors.New("source MAC must be a non-zero unicast address")
 	}
-	out := make([]byte, width)
-	copy(out[width-len(b):], b)
-	return out
-}
-
-// installLearned writes the smac (suppresses future digests for this
-// MAC) and dmac (forward target) entries for a newly-learned MAC.
-func installLearned(ctx context.Context, c *client.Client, p *pipeline.Pipeline, mac []byte, port uint32) {
+	if port == 0 || port > l.ports {
+		return fmt.Errorf("ingress port %d is outside the configured host ports", port)
+	}
+	key := hex.EncodeToString(mac)
+	if existing, seen := l.learned[key]; seen {
+		if existing != port {
+			return fmt.Errorf("MAC is already bound to port %d, movement is not supported", existing)
+		}
+		return nil
+	}
+	if err := installLearned(ctx, l.writer, l.pipeline, mac, port); err != nil {
+		return err
+	}
+	l.learned[key] = port
 	log.Printf("learn: %s @ port %d", codec.FormatHex(mac), port)
+	return nil
+}
 
-	// smac: exact(srcAddr) -> NoAction. Stops BMv2 from re-firing the
-	// digest for this MAC.
+// Install forwarding before suppressing future digests for this MAC.
+func installLearned(ctx context.Context, c tableWriter, p *pipeline.Pipeline, mac []byte, port uint32) error {
 	smac, err := tableentry.NewBuilder(p, "MyIngress.smac").
 		Match("hdr.ethernet.srcAddr", tableentry.Exact(mac)).
 		Action("NoAction").
 		Build()
 	if err != nil {
-		log.Printf("build smac: %v", err)
-		return
-	}
-	if err := c.WriteTableEntry(ctx, client.UpdateInsert, smac); err != nil {
-		log.Printf("insert smac %s: %v", codec.FormatHex(mac), err)
+		return fmt.Errorf("build smac: %w", err)
 	}
 
 	// dmac: exact(dstAddr) -> forward(port)
@@ -226,10 +272,31 @@ func installLearned(ctx context.Context, c *client.Client, p *pipeline.Pipeline,
 			tableentry.Param("egress_port", codec.MustEncodeUint(uint64(port), 9))).
 		Build()
 	if err != nil {
-		log.Printf("build dmac: %v", err)
-		return
+		return fmt.Errorf("build dmac: %w", err)
 	}
-	if err := c.WriteTableEntry(ctx, client.UpdateInsert, dmac); err != nil {
-		log.Printf("insert dmac %s: %v", codec.FormatHex(mac), err)
+	if err := upsertEntry(ctx, c, dmac); err != nil {
+		return fmt.Errorf("write dmac: %w", err)
 	}
+	if err := upsertEntry(ctx, c, smac); err != nil {
+		return fmt.Errorf("write smac: %w", err)
+	}
+	return nil
+}
+
+func upsertEntry(ctx context.Context, c tableWriter, entry *p4v1.TableEntry) error {
+	err := c.WriteTableEntry(ctx, client.UpdateInsert, entry)
+	if errors.Is(err, sdkerrors.ErrEntryExists) || status.Code(err) == codes.AlreadyExists {
+		return c.WriteTableEntry(ctx, client.UpdateModify, entry)
+	}
+	// P4Runtime may report per-update errors inside an UNKNOWN batch status.
+	st, ok := status.FromError(err)
+	if ok && st.Code() == codes.Unknown {
+		details := st.Details()
+		if len(details) == 1 {
+			if detail, ok := details[0].(*p4v1.Error); ok && detail.GetCanonicalCode() == int32(codes.AlreadyExists) {
+				return c.WriteTableEntry(ctx, client.UpdateModify, entry)
+			}
+		}
+	}
+	return err
 }

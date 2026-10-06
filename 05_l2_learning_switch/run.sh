@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Case 05: L2 learning switch (digest variant).
 #
-#   sudo ./run.sh        # pingAll twice, expect 100% on both
+#   sudo ./run.sh        # verify MAC tables, ping and packet delivery
 #   sudo ./run.sh cli    # drop into mininet CLI after bring-up
 
 set -euo pipefail
@@ -27,7 +27,7 @@ if [[ "${MODE}" == "test" ]]; then
     EXTRA+=(--run-test)
 fi
 
-log "Starting mininet + controller + (optional) pingAll"
+log "Starting mininet + controller + (optional) learning validation"
 start_topology "${CASE_DIR}/topology.py" \
     --p4info "${BUILD_DIR}/main_digest.p4info.txt" \
     --config "${BUILD_DIR}/main_digest.json" \
