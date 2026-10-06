@@ -92,10 +92,6 @@ control MyIngress(inout headers hdr,
                  ip4Addr_t outer_sip,
                  ip4Addr_t outer_dip,
                  bit<24>   vni) {
-        if (standard_metadata.packet_length > MAX_INNER_FRAME) {
-            drop();
-            return;
-        }
         standard_metadata.egress_spec = egress_port;
 
         hdr.outer_eth.setValid();
@@ -142,7 +138,8 @@ control MyIngress(inout headers hdr,
     }
 
     apply {
-        if (standard_metadata.parser_error != error.NoError) {
+        if (standard_metadata.parser_error != error.NoError ||
+            standard_metadata.packet_length > MAX_INNER_FRAME) {
             drop();
             return;
         }
