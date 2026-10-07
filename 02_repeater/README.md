@@ -1,65 +1,60 @@
-# 🔁 Case 02 · Port Repeater
+# Case 02 · Port Repeater
 
-> **学习目标**: 理解 P4 最简单的"端口映射"行为;体会"硬编码的 if-else"与"查找表"的差别。
+这个案例用硬编码的端口映射实现双向转发，控制器只安装流水线，无需写入表项。
 
-## 功能
+## 转发规则
 
-两端口交换机,**P4 程序硬编码** 1↔2 互转:
-
-```
-h1  --port 1 -- s1 -- port 2--  h2
-           (ingress==1 → egress=2;ingress==2 → egress=1)
+```text
+h1 -- port 1 -- s1 -- port 2 -- h2
 ```
 
-依然**无需下表**,控制器只推 pipeline。如果要改转发方向,必须重新编译 P4;这正是"硬编码控制面"的局限,下一案例 (03) 会展示用表替换掉这种硬编码。
+端口 1 收到的完整以太帧转发到端口 2，端口 2 收到的转发到端口 1。其他入端口的报文，以及以太头不足 14 字节的报文均丢弃。
+
+目的 MAC 不影响转发方向。发往发送主机自身、未知地址、广播和组播地址的帧都转发到另一端口。P4 不解析以太头之后的内容，MAC、EtherType、载荷、VLAN 标签和填充字节均保持原样。IPv4 的 TTL 和校验和、IPv6 的 Hop Limit 也不参与转发判断。
+
+如果需要调整端口映射，需要修改并重新编译 `main.p4`。下一个案例会通过表项配置转发端口。
 
 ## 文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `main.p4` | 解析以太头 → `if-else` 选择 egress → 重封装 |
-| `topology.py` | Mininet 2 主机拓扑 |
-| `controller/main.go` | 推 pipeline → 睡到被 SIGTERM |
-| `test.py` | h1 发 / h2 收一帧验证 |
-| `run.sh` | 一键编译 + 启动 + 测试 |
+| 文件                 | 作用                                 |
+| -------------------- | ------------------------------------ |
+| `main.p4`            | 解析以太头，检查解析状态并选择出端口 |
+| `topology.py`        | 两主机拓扑、探针管理和完整帧校验     |
+| `packets.py`         | 构造双向测试帧和重复帧               |
+| `test.py`            | 在主机内发送帧并采集带标记的入站帧   |
+| `controller/main.go` | 安装流水线并等待退出信号             |
+| `run.sh`             | 编译、启动网络并运行测试             |
 
-## P4 要点
+## 运行与测试
 
-```p4
-apply {
-    if (standard_metadata.ingress_port == 1) {
-        standard_metadata.egress_spec = 2;
-    } else if (standard_metadata.ingress_port == 2) {
-        standard_metadata.egress_spec = 1;
-    } else {
-        mark_to_drop(standard_metadata);
-    }
-}
-```
-
-注意 **无 `table.apply()`**,**无 action**,一切都在 `apply{}` 的控制流里。
-
-## 运行
+在案例目录执行：
 
 ```bash
-sudo ./run.sh          # 自动测试
-sudo ./run.sh cli      # 进入 mininet CLI
+sudo ./run.sh
+sudo ./run.sh cli
 ```
 
-## 预期输出
+默认测试发送 174 帧，两个方向各 87 帧。每个方向覆盖 7 种目的 MAC 和 12 种内容，包括 IPv4、IPv6、ARP、单层 VLAN、QinQ、填充字节、1500 字节载荷及重复帧。TTL 为 0 或 1、Hop Limit 为 0 和 IPv4 校验和错误的帧也应完整转发。
 
+两个接收探针就绪后才开始发送。测试逐字节比较全部帧及每帧的份数，检查遗漏、重复、内容改动和返回源端口的帧。Linux 接收路径剥离的外层 VLAN 标签通过辅助数据恢复。探针异常退出、回复无效、发送数量不足、等待超时或控制器提前退出都会使测试失败。
+
+完整帧检查后执行 `pingAll`，验证双向 ARP 和 ICMP 通信。预期关键输出：
+
+```text
+Repeater probes: sent=174 received=174
+ping drop ratio: 0.0%
+SUCCESS: bidirectional repeater forwarding and complete frames validated
 ```
-    controller: pipeline installed via VERIFY_AND_COMMIT; repeater ready
-*** Starting sniffer on h2
-*** Sending test frame from h1
-    SEND: 00:00:00:00:00:01 -> 00:00:00:00:00:02 payload=b'hello-repeater'
-SUCCESS: received src=00:00:00:00:00:01 dst=00:00:00:00:00:02 payload=b'hello-repeater'
+
+在仓库根目录运行回归测试：
+
+```bash
+/usr/bin/python3 -m unittest discover -s tests -v
+go test ./...
 ```
 
-## 故障排查
+## 排查问题
 
-**h2 没收到包**:  
-→ `sudo mn -c` 清理残留,重跑。
+先查看控制器输出和 `s1.log`，确认流水线安装成功。`test.py` 的 `send` 和 `receive` 子命令使用显式参数，可通过 `python3 test.py send --help` 和 `python3 test.py receive --help` 查看用法。
 
-**`test.py` 脚本本身挂住**:  
-→ 检查 scapy 版本 ≥ 2.4.5(有 `AsyncSniffer`);`python3 -c "import scapy; print(scapy.__version__)"`。
+自动测试结束、启动失败或收到退出信号时会清理本次网络。若进程被强制终止，先确认没有其他拓扑运行，再手动清理残留。

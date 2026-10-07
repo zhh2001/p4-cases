@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile the P4 program, boot mininet with 2 hosts, let the Go
-# controller push the pipeline, run a send/sniff verification across
+# controller push the pipeline, verify complete frames in both directions across
 # h1 <-> h2, and tear everything down.
 #
 #   sudo ./run.sh        # automated test

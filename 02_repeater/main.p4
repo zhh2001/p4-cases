@@ -44,6 +44,11 @@ control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
     apply {
+        if (standard_metadata.parser_error != error.NoError ||
+            !hdr.ethernet.isValid()) {
+            mark_to_drop(standard_metadata);
+            return;
+        }
         if (standard_metadata.ingress_port == 1) {
             standard_metadata.egress_spec = 2;
         } else if (standard_metadata.ingress_port == 2) {
