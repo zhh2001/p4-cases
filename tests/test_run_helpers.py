@@ -89,13 +89,14 @@ class RunHelpersTests(unittest.TestCase):
         fake_compiler.chmod(0o755)
         fake_topology.chmod(0o755)
         environment = dict(os.environ, PATH=f"{commands}:{os.environ['PATH']}")
-        for case, stem in (
-            ("07_meter", "indirect_meter"),
-            ("08_counter", "indirect_counter"),
+        for case, stem, options in (
+            ("07_meter", "indirect_meter", []),
+            ("08_counter", "indirect_counter", []),
+            ("08_counter", "direct_counter", ["test", "direct"]),
         ):
-            with self.subTest(case=case):
+            with self.subTest(case=case, stem=stem):
                 directory = fixture / case
-                (directory / "build").mkdir(parents=True)
+                (directory / "build").mkdir(parents=True, exist_ok=True)
                 script = directory / "run.sh"
                 script.write_text((ROOT / case / "run.sh").read_text())
                 (directory / "build/main.json").write_text("stale pipeline")
@@ -105,9 +106,10 @@ class RunHelpersTests(unittest.TestCase):
                         [
                             "bash",
                             "-c",
-                            'go() { : > "$3"; }; export -f go; exec bash "$1"',
+                            'go() { : > "$3"; }; export -f go; exec bash "$@"',
                             "test",
                             str(script),
+                            *options,
                         ],
                         env=environment,
                         text=True,

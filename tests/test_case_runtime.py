@@ -81,12 +81,13 @@ class CaseRuntimeTests(unittest.TestCase):
     def test_counter_dump_parses_complete_reply(self):
         controller = self.controller(
             "import sys; sys.stdin.readline(); "
-            "print('port=1 packets=7 bytes=70'); print('dump-done')",
+            "print('port=1 packets=7 bytes=70'); "
+            "print('port=2 packets=0 bytes=0'); print('dump-done')",
             interactive=True,
         )
         self.assertEqual(
             load_case(8).dump_counters(controller),
-            {1: {"packets": 7, "bytes": 70}},
+            {1: {"packets": 7, "bytes": 70}, 2: {"packets": 0, "bytes": 0}},
         )
 
     def test_counter_dump_times_out_on_silent_controller(self):

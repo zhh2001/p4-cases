@@ -2,11 +2,8 @@
 #include <core.p4>
 #include <v1model.p4>
 
-const bit<16> TYPE_IPV4 = 0x800;
-
 typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
-typedef bit<32> ip4Addr_t;
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -14,9 +11,7 @@ header ethernet_t {
     bit<16>   etherType;
 }
 
-struct metadata {
-    bit<32> meter_tag;
-}
+struct metadata {}
 
 struct headers {
     ethernet_t ethernet;
@@ -45,19 +40,32 @@ control MyIngress(inout headers hdr,
 
     direct_counter(CounterType.packets_and_bytes) direct_port_counter;
 
+    action drop() {
+        mark_to_drop(standard_metadata);
+    }
+
+    action forward(egressSpec_t port) {
+        standard_metadata.egress_spec = port;
+    }
+
     table count_table {
         key = {
             standard_metadata.ingress_port: exact;
         }
         actions = {
-            NoAction;
+            forward;
+            drop;
         }
-        default_action = NoAction;
+        default_action = drop;
         counters = direct_port_counter;
-        size = 512;
+        size = 2;
     }
 
     apply {
+        if (standard_metadata.parser_error != error.NoError) {
+            drop();
+            return;
+        }
         count_table.apply();
     }
 }

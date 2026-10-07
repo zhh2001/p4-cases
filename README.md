@@ -29,7 +29,7 @@
 | [05](05_l2_learning_switch/)    | L2 学习交换机     | **Digest** (数据面→控制面通知)         | 启用并订阅 digest，动态写入 `smac`/`dmac`        |
 | [06](06_int/)                   | 带内网络遥测      | **多交换机 + IPv4 Options + 逐跳遥测** | 并行 3 个控制器，各装 LPM + `int_table` 默认动作 |
 | [07](07_meter/)                 | Meter             | **Meter extern / 三色标记**            | `MeterEntry` 配 CIR/PIR，drop 非绿流量           |
-| [08](08_counter/)               | Counter           | **Counter extern / 读取累积值**        | `CounterEntry` 读出包数 / 字节数                 |
+| [08](08_counter/)               | Counter           | **Counter extern / 读取累积值**        | 按索引或表项读取包数和字节数                     |
 | [09](09_ecmp_hash/)             | ECMP 多路径       | **5-tuple hash + ecmp group**          | direct /32 + /24 ECMP + `ecmp_nhop` 2 个成员     |
 | [10](10_firewall_acl/)          | 防火墙 ACL        | **TERNARY 表 + priority**              | 3 条不同优先级的 allow/deny 规则                 |
 | [11](11_vxlan_encap/)           | VXLAN 封装        | **头部插入 / `setValid()`**            | 一条 vtep 表，配置出口、外层地址与 VNI           |
@@ -116,7 +116,7 @@ p4-cases/
 | 05      | 读回两张 MAC 表并核对端口，两轮 `pingAll` 零丢包，逐主机捕获报文验证泛洪和学习后的单播                              |
 | 06      | h2 的 INT 栈包含 `swid ∈ {1,2}` 至少 2 条                                                                           |
 | 07      | 完整交付非计量流量，按实际突发时长核对计量上限，并验证令牌补充后恢复转发                                            |
-| 08      | port 1 counter 增量 ≥ 我们注入的包数                                                                                |
+| 08      | 两种 counter 均验证双向完整转发，精确核对两个端口的包数和字节数                                                     |
 | 09      | h2 和 h3 均收到 >0 的 ECMP 分发流量                                                                                 |
 | 10      | 按 IHL 读取端口，核对双向正常和 Options 流量，丢弃 IPv4 分片及所检查的格式异常报文                                  |
 | 11      | 按入包长度生成 VXLAN 外层头，逐字节核对完整封装帧，并检查未匹配流量的丢弃                                           |

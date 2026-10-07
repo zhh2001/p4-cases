@@ -1,11 +1,7 @@
 // Case 08: per-port packet counter reader.
 //
-// The P4 pipeline auto-increments `port_counter[ingress_port]` for
-// every packet and cross-forwards port 1 <-> port 2 so the mininet
-// hosts can actually exchange traffic. The controller pushes the
-// pipeline, accepts a `dump` command on stdin (produced by the test
-// script), and on each dump reads port_counter values for ports 1
-// and 2 via the counter SDK, printing them back on stdout.
+// Supports an indirect counter indexed by ingress port and a direct
+// counter attached to one forwarding entry per ingress port.
 package main
 
 import (
@@ -19,10 +15,104 @@ import (
 	"syscall"
 	"time"
 
+	p4v1 "github.com/p4lang/p4runtime/go/p4/v1"
+
 	"github.com/zhh2001/p4runtime-go-controller/client"
+	"github.com/zhh2001/p4runtime-go-controller/codec"
 	"github.com/zhh2001/p4runtime-go-controller/counter"
 	"github.com/zhh2001/p4runtime-go-controller/pipeline"
+	"github.com/zhh2001/p4runtime-go-controller/tableentry"
 )
+
+type sample struct {
+	packets int64
+	bytes   int64
+}
+
+func indirectSample(entries []*counter.Data, port int64) (sample, error) {
+	if len(entries) != 1 || entries[0] == nil || entries[0].Index != port {
+		return sample{}, fmt.Errorf("expected one counter entry for port %d", port)
+	}
+	entry := entries[0]
+	if entry.Packets < 0 || entry.Bytes < 0 {
+		return sample{}, fmt.Errorf("negative counter values for port %d", port)
+	}
+	return sample{entry.Packets, entry.Bytes}, nil
+}
+
+func directSample(entities []*p4v1.Entity, key *p4v1.TableEntry) (sample, error) {
+	if len(entities) != 1 || key == nil || len(key.Match) != 1 || key.Match[0].GetExact() == nil {
+		return sample{}, fmt.Errorf("expected one direct counter entry")
+	}
+	entry := entities[0].GetDirectCounterEntry()
+	table := entry.GetTableEntry()
+	if entry == nil || entry.Data == nil || table == nil || table.TableId != key.TableId ||
+		table.IsDefaultAction || len(table.Match) != 1 || table.Match[0].GetFieldId() != key.Match[0].GetFieldId() ||
+		table.Match[0].GetExact() == nil {
+		return sample{}, fmt.Errorf("direct counter reply does not match the requested table entry")
+	}
+	want, err := codec.DecodeUint(key.Match[0].GetExact().GetValue())
+	if err != nil {
+		return sample{}, err
+	}
+	actual, err := codec.DecodeUint(table.Match[0].GetExact().GetValue())
+	if err != nil || actual != want || entry.Data.PacketCount < 0 || entry.Data.ByteCount < 0 {
+		return sample{}, fmt.Errorf("invalid direct counter reply")
+	}
+	return sample{entry.Data.PacketCount, entry.Data.ByteCount}, nil
+}
+
+func prepareCounters(ctx context.Context, c *client.Client, p *pipeline.Pipeline) (
+	func(context.Context, int64) (sample, error), string, error,
+) {
+	if _, ok := p.Counter("MyIngress.port_counter"); ok {
+		r, err := counter.NewReader(c, p)
+		if err != nil {
+			return nil, "", err
+		}
+		return func(ctx context.Context, port int64) (sample, error) {
+			entries, err := r.Read(ctx, "MyIngress.port_counter", port)
+			if err != nil {
+				return sample{}, err
+			}
+			return indirectSample(entries, port)
+		}, "indirect", nil
+	}
+	definition, ok := p.DirectCounter("MyIngress.direct_port_counter")
+	if !ok || definition.DirectTableName != "MyIngress.count_table" {
+		return nil, "", fmt.Errorf("pipeline does not contain a supported port counter")
+	}
+	keys := make(map[int64]*p4v1.TableEntry)
+	for _, port := range []int64{1, 2} {
+		entry, err := tableentry.NewBuilder(p, definition.DirectTableName).
+			Match("standard_metadata.ingress_port", tableentry.Exact(codec.MustEncodeUint(uint64(port), 9))).
+			Action("MyIngress.forward", tableentry.Param("port", codec.MustEncodeUint(uint64(3-port), 9))).
+			Build()
+		if err != nil {
+			return nil, "", err
+		}
+		writeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err = c.WriteTableEntry(writeCtx, client.UpdateInsert, entry)
+		cancel()
+		if err != nil {
+			return nil, "", err
+		}
+		keys[port] = &p4v1.TableEntry{TableId: entry.TableId, Match: entry.Match}
+	}
+	return func(ctx context.Context, port int64) (sample, error) {
+		key, ok := keys[port]
+		if !ok {
+			return sample{}, fmt.Errorf("unsupported ingress port %d", port)
+		}
+		entities, err := c.Read(ctx, &p4v1.Entity{Entity: &p4v1.Entity_DirectCounterEntry{
+			DirectCounterEntry: &p4v1.DirectCounterEntry{TableEntry: key},
+		}})
+		if err != nil {
+			return sample{}, err
+		}
+		return directSample(entities, key)
+	}, "direct", nil
+}
 
 func main() {
 	var (
@@ -73,11 +163,11 @@ func main() {
 	}
 	log.Printf("pipeline installed via %s", res.Action)
 
-	r, err := counter.NewReader(c, p)
+	readCounter, variant, err := prepareCounters(ctx, c, p)
 	if err != nil {
-		log.Fatalf("counter reader: %v", err)
+		log.Fatalf("prepare counters: %v", err)
 	}
-	fmt.Println("counter ready; send 'dump' on stdin to print port_counter[1..2]")
+	fmt.Printf("counter ready: %s, send 'dump' to read ports 1 and 2\n", variant)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -93,18 +183,12 @@ func main() {
 		case "dump":
 			for _, port := range []int64{1, 2} {
 				readCtx, readCancel := context.WithTimeout(ctx, 3*time.Second)
-				entries, err := r.Read(readCtx, "MyIngress.port_counter", port)
+				value, err := readCounter(readCtx, port)
 				readCancel()
 				if err != nil {
-					fmt.Printf("ERR port %d: %v\n", port, err)
-					continue
+					log.Fatalf("read counter for port %d: %v", port, err)
 				}
-				var pkts, bytes int64
-				for _, e := range entries {
-					pkts += e.Packets
-					bytes += e.Bytes
-				}
-				fmt.Printf("port=%d packets=%d bytes=%d\n", port, pkts, bytes)
+				fmt.Printf("port=%d packets=%d bytes=%d\n", port, value.packets, value.bytes)
 			}
 			fmt.Println("dump-done")
 		case "quit", "":

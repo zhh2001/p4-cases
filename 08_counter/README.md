@@ -1,74 +1,68 @@
-# 📊 Case 08 · 按端口统计(Counter)
+# Case 08：按端口统计包数和字节数
 
-> **学习目标**: P4 的 **counter extern**,按 ingress 端口统计包数和字节数;控制器通过 P4Runtime `CounterEntry` **读**回累积值。
+本案例用两种 counter 统计入端口的流量，并在端口 1 和端口 2 之间双向转发。两份 P4 程序都保留完整以太网帧，解析失败或来自其他端口的报文会被丢弃。
 
-## Pipeline
+## 间接 counter
 
-```p4
-counter(512, CounterType.packets_and_bytes) port_counter;
-apply {
-    port_counter.count((bit<32>)standard_metadata.ingress_port);
-    // 教学目的:再做一个 1<->2 cross-forward,让包真的能到对端
-    if (ingress == 1) egress = 2; else if (ingress == 2) egress = 1; else drop;
-}
-```
+`indirect_counter.p4` 使用容量为 512 的计数器，以 `standard_metadata.ingress_port` 为索引。端口 1 的报文从端口 2 发出，端口 2 的报文从端口 1 发出，然后累加对应入端口的包数和字节数。
 
-没有表,只有 counter extern + 硬编码 cross-forward(你也可以认为是"Case 02 + 计数器")。
+控制器通过 `counter.NewReader` 按索引读取 `MyIngress.port_counter`。每次读取必须返回一条索引匹配、数值非负的记录。
 
-## 交互模型
+## 直接 counter
 
-控制器不"订阅"counter,它的 API 是**按需读**。本案例让 Go 控制器在 `stdin` 上开一个命令循环:`dump` 一行 → 读一次 counter → 打印到 `stdout`。`topology.py` 在测试里发送 `dump`,然后发 20 帧,再 `dump`,对比增量。
+`direct_counter.p4` 把 `direct_port_counter` 绑定到 `count_table`。控制器写入两条精确匹配入端口的表项，分别执行 `forward(2)` 和 `forward(1)`。未命中时执行丢弃动作。
+
+在 v1model 中，直接 counter 会自动统计命中表项的报文。控制器使用包含表 ID 和匹配键的 `DirectCounterEntry` 读取对应表项的累积值，并检查回复中的表项和数值。
+
+控制器根据 P4Info 选择读取方式。它在标准输入上接受 `dump` 命令，依次打印两个端口的包数和字节数，最后打印 `dump-done`。读取失败时退出，测试不会把缺失的记录当作零。
 
 ## 文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `indirect_counter.p4` | 间接 counter(容量 512,用 ingress_port 当索引) |
-| `direct_counter.p4` | 直接 counter(供对比) |
-| `controller/main.go` | 推 pipeline + 处理 `dump` 命令 + 通过 `counter.NewReader` 读取 |
-| `topology.py` | 2 主机;调用 `dump`、发 20 帧、再 `dump`、验证 port 1 增量 ≥ 20 |
-
-## Go 控制器要点
-
-```go
-r, _ := counter.NewReader(c, p)
-for _, port := range []int64{1, 2} {
-    entries, _ := r.Read(ctx, "MyIngress.port_counter", port)   // port=具体索引
-    var pkts, bytes int64
-    for _, e := range entries {
-        pkts += e.Packets
-        bytes += e.Bytes
-    }
-    fmt.Printf("port=%d packets=%d bytes=%d\n", port, pkts, bytes)
-}
-```
-
-`counter.NewReader(c, p).Read(ctx, "<name>", index)` —— `index=-1` 读所有条目,非负则读单条。
+| 文件                  | 作用                                                |
+| --------------------- | --------------------------------------------------- |
+| `indirect_counter.p4` | 按入端口索引计数，并执行双向转发                    |
+| `direct_counter.p4`   | 通过两条转发表项统计各入端口                        |
+| `controller/main.go`  | 安装流水线、配置直接 counter 的表项，并按需读取计数 |
+| `topology.py`         | 启动两台主机和一台交换机，验证转发及计数            |
+| `probe.py`            | 发送原始以太网帧，捕获带有本轮标记的入站帧          |
+| `run.sh`              | 选择 counter 类型，编译并启动测试或交互模式         |
 
 ## 运行
 
+在本目录执行：
+
 ```bash
+# 默认运行间接 counter 的自动测试
 sudo ./run.sh
+
+# 运行直接 counter 的自动测试
+sudo ./run.sh test direct
+
+# 进入 Mininet CLI
+sudo ./run.sh cli
+sudo ./run.sh cli direct
 ```
 
-## 预期输出
+交互模式可用 `h1 ping -c 3 10.0.0.2` 检查连通性。自动测试使用原始以太网帧，不依赖 ARP 解析。
 
+## 自动验证
+
+测试先检查空闲状态，再分别检查 h1 到 h2 和 h2 到 h1 的流量。每个方向发送 30 帧，帧长为 60、64、128、512、1500 和 1514 字节，每种长度各 5 帧。
+
+每轮都读取两个端口的前后计数，并在两台主机上捕获带有本轮标记的帧。判定条件如下：
+
+- 对端完整收到全部测试帧，内容逐字节一致，没有丢失、重复或额外帧
+- 发送端没有收到被反射的测试帧
+- 对应入端口恰好增加 30 包和 18890 字节
+- 另一入端口的包数和字节数保持不变
+- 空闲阶段两个端口的计数均保持不变
+
+字节数包含以太网头，不包含前导码和 FCS。测试使用前后增量，不要求计数器初始值为零。自动测试会关闭本次拓扑接口的 IPv6，避免邻居发现报文影响精确计数。交互模式保留正常的主机网络配置。
+
+成功时输出：
+
+```text
+SUCCESS: both ports forward complete frames and count exact packets and bytes
 ```
-    controller: counter ready; send 'dump' on stdin to print port_counter[1..2]
-*** Initial counter snapshot
-    controller: port=1 packets=0 bytes=0
-    controller: port=2 packets=0 bytes=0
-*** Sending 20 frames from h1
-*** Post-blast counter snapshot
-    controller: port=1 packets=1208 bytes=18692
-    controller: port=2 packets=9 bytes=782
-port 1 packet delta = 1208 (expected >= 20)
-SUCCESS: port 1 counter incremented by the blasted frames
-```
 
-port 1 增量远大于 20 的原因:mininet host 每秒会自发送 IPv6 RA / ARP / broadcast 等,这些也进了 counter。**只有一个条件必须成立**:port 1 增量 ≥ 我们的 20 帧。
-
-## 延伸
-
-- **重置 counter**:P4Runtime 没有通用 reset;常规做法是 MODIFY counter 条目,把值清零。SDK `counter.Reader.Write(ctx, name, idx, 0, 0)` 能做到。
-- **Direct counter**:`direct_counter.p4` 展示把 counter 绑在表上,和 meter 的 direct 变体是对偶结构。
+计数回复缺失、格式异常、读取超时或收发进程失败都会使测试退出。退出时会清理本次启动的收发进程、控制器和网络。
