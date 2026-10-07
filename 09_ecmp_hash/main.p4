@@ -4,8 +4,8 @@
  *
  * The ingress pipeline does a per-flow 5-tuple hash and uses the
  * result to pick one of N next-hops installed by the controller. A
- * single flow (same src/dst IP + same ports) always lands on the same
- * next-hop; different flows spread across the ecmp group.
+ * single TCP or UDP flow always lands on the same next-hop. IPv4
+ * fragments and other protocols use zero ports in the hash input.
  *
  * Data-plane structure:
  *
@@ -20,6 +20,12 @@
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV4 = 0x0800;
+
+error {
+    InvalidIPv4Version,
+    InvalidIPv4Length,
+    InvalidTransportLength
+}
 
 typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
@@ -53,14 +59,36 @@ header udp_t {
     bit<16> checksum;
 }
 
+header tcp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<32> seqNo;
+    bit<32> ackNo;
+    bit<4>  dataOffset;
+    bit<4>  reserved;
+    bit<8>  flags;
+    bit<16> window;
+    bit<16> checksum;
+    bit<16> urgentPtr;
+}
+
+header ipv4_options_t {
+    varbit<320> data;
+}
+
 struct metadata {
     bit<14> ecmp_select;
+    bit<16> src_port;
+    bit<16> dst_port;
+    bit<16> transport_length;
 }
 
 struct headers {
     ethernet_t ethernet;
     ipv4_t     ipv4;
+    ipv4_options_t options;
     udp_t      udp;
+    tcp_t      tcp;
 }
 
 parser MyParser(packet_in packet,
@@ -68,6 +96,8 @@ parser MyParser(packet_in packet,
                 inout metadata meta,
                 inout standard_metadata_t standard_metadata) {
     state start {
+        meta.src_port = 0;
+        meta.dst_port = 0;
         packet.extract(hdr.ethernet);
         transition select(hdr.ethernet.etherType) {
             TYPE_IPV4: parse_ipv4;
@@ -76,18 +106,73 @@ parser MyParser(packet_in packet,
     }
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
+        verify(hdr.ipv4.version == 4, error.InvalidIPv4Version);
+        verify(hdr.ipv4.ihl >= 5, error.InvalidIPv4Length);
+        verify(hdr.ipv4.totalLen >= (bit<16>)hdr.ipv4.ihl * 4,
+               error.InvalidIPv4Length);
+        verify((bit<32>)hdr.ipv4.totalLen <= standard_metadata.packet_length - 14,
+               error.InvalidIPv4Length);
+        meta.transport_length = hdr.ipv4.totalLen - (bit<16>)hdr.ipv4.ihl * 4;
+        transition select(hdr.ipv4.ihl) {
+            5:       parse_fragment;
+            default: parse_options;
+        }
+    }
+    state parse_options {
+        packet.extract(hdr.options, ((bit<32>)hdr.ipv4.ihl - 5) * 32);
+        transition parse_fragment;
+    }
+    state parse_fragment {
+        // All fragments, including the first, keep zero transport ports.
+        transition select(hdr.ipv4.flags[0:0], hdr.ipv4.fragOffset) {
+            (0, 0):  parse_protocol;
+            default: accept;
+        }
+    }
+    state parse_protocol {
         transition select(hdr.ipv4.protocol) {
+            6:       parse_tcp;
             17:      parse_udp;
             default: accept;
         }
     }
     state parse_udp {
+        verify(meta.transport_length >= 8, error.InvalidTransportLength);
         packet.extract(hdr.udp);
+        verify(hdr.udp.length_ >= 8 && hdr.udp.length_ <= meta.transport_length,
+               error.InvalidTransportLength);
+        meta.src_port = hdr.udp.srcPort;
+        meta.dst_port = hdr.udp.dstPort;
+        transition accept;
+    }
+    state parse_tcp {
+        verify(meta.transport_length >= 20, error.InvalidTransportLength);
+        packet.extract(hdr.tcp);
+        verify(hdr.tcp.dataOffset >= 5 &&
+               (bit<16>)hdr.tcp.dataOffset * 4 <= meta.transport_length,
+               error.InvalidTransportLength);
+        meta.src_port = hdr.tcp.srcPort;
+        meta.dst_port = hdr.tcp.dstPort;
         transition accept;
     }
 }
 
-control MyVerifyChecksum(inout headers hdr, inout metadata meta) { apply {} }
+#define IPV4_FIELDS \
+    hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.diffserv, \
+    hdr.ipv4.totalLen, hdr.ipv4.identification, hdr.ipv4.flags, \
+    hdr.ipv4.fragOffset, hdr.ipv4.ttl, hdr.ipv4.protocol, \
+    hdr.ipv4.srcAddr, hdr.ipv4.dstAddr
+
+control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
+    apply {
+        verify_checksum(hdr.ipv4.isValid() && !hdr.options.isValid(),
+                        { IPV4_FIELDS }, hdr.ipv4.hdrChecksum,
+                        HashAlgorithm.csum16);
+        verify_checksum(hdr.ipv4.isValid() && hdr.options.isValid(),
+                        { IPV4_FIELDS, hdr.options.data }, hdr.ipv4.hdrChecksum,
+                        HashAlgorithm.csum16);
+    }
+}
 
 control MyIngress(inout headers hdr,
                   inout metadata meta,
@@ -108,30 +193,51 @@ control MyIngress(inout headers hdr,
         hash(meta.ecmp_select,
              HashAlgorithm.crc16,
              ecmp_base,
-             { hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
-               hdr.ipv4.protocol, hdr.udp.srcPort, hdr.udp.dstPort },
+             {
+                hdr.ipv4.srcAddr,
+                hdr.ipv4.dstAddr,
+                hdr.ipv4.protocol,
+                meta.src_port,
+                meta.dst_port
+             },
              ecmp_count);
     }
 
     table ipv4_lpm {
-        key = { hdr.ipv4.dstAddr: lpm; }
-        actions = { set_ecmp_select; set_nhop; drop; NoAction; }
+        key = {
+            hdr.ipv4.dstAddr: lpm;
+        }
+        actions = {
+            set_ecmp_select;
+            set_nhop;
+            drop;
+            NoAction;
+        }
         size = 1024;
         default_action = drop;
     }
 
     table ecmp_nhop {
-        key = { meta.ecmp_select: exact; }
-        actions = { set_nhop; drop; }
+        key = {
+            meta.ecmp_select: exact;
+        }
+        actions = {
+            set_nhop;
+            drop;
+        }
         size = 256;
         default_action = drop;
     }
 
     apply {
-        if (hdr.ipv4.isValid() && hdr.ipv4.ttl > 0) {
-            switch (ipv4_lpm.apply().action_run) {
-                set_ecmp_select: { ecmp_nhop.apply(); }
-            }
+        if (standard_metadata.parser_error != error.NoError ||
+            standard_metadata.checksum_error == 1 ||
+            !hdr.ipv4.isValid() || hdr.ipv4.ttl <= 1) {
+            drop();
+            return;
+        }
+        switch (ipv4_lpm.apply().action_run) {
+            set_ecmp_select: { ecmp_nhop.apply(); }
         }
     }
 }
@@ -142,14 +248,12 @@ control MyEgress(inout headers hdr,
 
 control MyComputeChecksum(inout headers hdr, inout metadata meta) {
     apply {
-        update_checksum(
-            hdr.ipv4.isValid(),
-            { hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.diffserv,
-              hdr.ipv4.totalLen, hdr.ipv4.identification, hdr.ipv4.flags,
-              hdr.ipv4.fragOffset, hdr.ipv4.ttl, hdr.ipv4.protocol,
-              hdr.ipv4.srcAddr, hdr.ipv4.dstAddr },
-            hdr.ipv4.hdrChecksum,
-            HashAlgorithm.csum16);
+        update_checksum(hdr.ipv4.isValid() && !hdr.options.isValid(),
+                        { IPV4_FIELDS }, hdr.ipv4.hdrChecksum,
+                        HashAlgorithm.csum16);
+        update_checksum(hdr.ipv4.isValid() && hdr.options.isValid(),
+                        { IPV4_FIELDS, hdr.options.data }, hdr.ipv4.hdrChecksum,
+                        HashAlgorithm.csum16);
     }
 }
 
@@ -157,7 +261,9 @@ control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
+        packet.emit(hdr.options);
         packet.emit(hdr.udp);
+        packet.emit(hdr.tcp);
     }
 }
 

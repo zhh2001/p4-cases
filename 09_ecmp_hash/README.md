@@ -1,10 +1,10 @@
-# 🌐 Case 09 · ECMP 等价多路径
+# Case 09：ECMP 等价多路径
 
-> **学习目标**: 用 **5-tuple hash** 把同一前缀的流量分摊到多个等价下一跳。单条流始终走同一条路径(避免乱序),不同流之间按 hash 分布。
+本案例通过五元组哈希选择下一跳。TCP 和 UDP 的同一条流始终走同一个 ECMP 成员，目的地址的 `/32` 路由优先于 `/24` ECMP 路由。
 
 ## 拓扑
 
-```
+```text
           h2 (port 2)
            |
     h1 -- s1
@@ -12,62 +12,92 @@
           h3 (port 3)
 ```
 
-1 交换机,3 主机。h1 是流量源,h2 和 h3 是两个 ECMP 成员。
+一个交换机连接三个主机。地址分别是 `10.0.0.1/24`、`10.0.0.2/24` 和 `10.0.0.3/24`，端口编号与主机编号一致。h2 和 h3 是 ECMP 成员，三个主机都可以发送测试流量。
 
-## Pipeline 架构
+## 数据面
 
+```text
+Ethernet -> IPv4 -> Options -> TCP / UDP
+                |
+                v
+            ipv4_lpm
+                |
+       +--------+---------+
+       |                  |
+   set_nhop        set_ecmp_select
+   direct /32             |
+                      ecmp_nhop
+                          |
+                      set_nhop
 ```
-hdr.ipv4.dstAddr ─LPM─> ipv4_lpm ──┬─ set_nhop(direct, 对 /32)
-                                   │
-                                   └─ set_ecmp_select(base, count) ──hash──> meta.ecmp_select
-                                                                             │
-                                                                             └─> ecmp_nhop (exact)
-                                                                                    │
-                                                                                    └─ set_nhop(具体下一跳)
-```
 
-两张表:`ipv4_lpm` 做目的 IP 路由决策(同时有 direct /32 条目和 /24 ECMP 条目),命中 `set_ecmp_select` 时触发哈希写入 `meta.ecmp_select`,再用它去 `ecmp_nhop` 表选最终下一跳。
+解析器根据 IHL 读取完整 IPv4 Options，再读取 TCP 或 UDP 头。TCP Options 和负载保留原样。IPv4 版本、头长、总长、传输层头长及 UDP 长度需要符合报文长度，IPv4 校验和覆盖整个 IP 头和 Options。
 
-Hash 覆盖 5-tuple:`(srcAddr, dstAddr, protocol, udp.srcPort, udp.dstPort)` 经 CRC-16 → `ecmp_select` 值。
+哈希输入依次为源 IP、目的 IP、协议、源端口和目的端口。BMv2 的 [CRC16 实现](https://github.com/p4lang/behavioral-model/blob/main/src/bm_sim/calculations.cpp) 使用 CRC-16/ARC，成员索引为 `base + hash % count`。本案例的 `base=0`、`count=2`，因此索引是 0 或 1。
+
+IPv4 分片统一将哈希中的两个端口置零，首片也不读取端口，仅由 IP 三元组决定路径。同一组分片保持同一路径，分片负载完整保留。分片与未分片报文可以选中不同的成员。其他 IP 协议也使用零端口，负载不会被当成 TCP 或 UDP 头。
+
+选中下一跳后，交换机将入包目的 MAC 写入源 MAC，将目的 MAC 改为下一跳地址，并将 TTL 减一。输出 IPv4 校验和包含 Options。TTL 为 0 或 1、解析失败、IPv4 校验和错误、没有路由或没有对应 ECMP 成员时丢弃报文。
 
 ## 控制器布表
 
-| 表 | 条目 |
-| --- | --- |
-| `ipv4_lpm` | `10.0.0.1/32 → set_nhop(port=1, mac=h1)` 等 3 条 direct,**以及** `10.0.0.0/24 → set_ecmp_select(base=0, count=2)` |
-| `ecmp_nhop` | `[0] → port 2 (h2)`,`[1] → port 3 (h3)` |
+| 表          | 条目                                                             |
+| ----------- | ---------------------------------------------------------------- |
+| `ipv4_lpm`  | `10.0.0.1/32`、`10.0.0.2/32`、`10.0.0.3/32` 分别直达端口 1、2、3 |
+| `ipv4_lpm`  | `10.0.0.0/24` 使用 `set_ecmp_select(base=0, count=2)`            |
+| `ecmp_nhop` | 索引 0 到 h2，索引 1 到 h3                                       |
 
-LPM 最长前缀匹配保证 direct /32 胜过 /24,h1/h2/h3 自身的回包不重入 ECMP。
+控制器完成全部表项写入后输出 `ecmp ready`。主机命中自己的 `/32` 路由时直接转发，不再进入 ECMP。
 
-## 测试
+## 自动验证
 
-`topology.py` 从 h1 发 20 个 UDP 包,**sport 从 1000 到 1019 递增**,dport 固定 5000,dst IP 全部 `10.0.0.100`(不存在的主机,但 /24 的 ECMP 条目会接管)。sniffer 分别在 h2 和 h3 抓取带 `b"ecmp-test"` 前缀的 UDP payload。
+默认测试发送 243 个报文，其中 223 个应转发，20 个应丢弃。测试同时在三个主机上抓包，确认接收器就绪后发送，并覆盖以下行为：
 
-期望:`h2+h3 合计 == 20` 且 `h2 > 0 && h3 > 0`。
+- TCP 和 UDP 各 20 条 ECMP 流，每条流从三个入端口各发送一次，改变负载、TTL 和 Options 后路径保持一致。
+- 分别改变源 IP、目的 IP、源端口和目的端口，按独立计算的 CRC16 核对每包路径。
+- 两种协议的全部主机间方向均命中直达路由。
+- TCP 和 UDP 的首片、中间片及末片使用一致路径，其他协议保持负载不变。
+- 覆盖最小传输层头、1500 字节 IP 报文、UDP 零校验和以及 TTL 边界。
+- 丢弃格式异常、头长或总长不符、校验和错误和无路由报文。
+
+每个正常报文必须只到达预期主机一次。测试逐字节核对 MAC、TTL、IPv4 校验和、Options、传输层头和负载，并拒绝缺包、重复包、错误出口和异常报文泄漏。发送进程、接收进程或控制器失败都会使测试返回非零状态，结束时清理本次网络和进程。
 
 ## 运行
 
 ```bash
-sudo ./run.sh        # 流量分布测试
-sudo ./run.sh cli    # 进 mininet CLI
+sudo ./run.sh
+sudo ./run.sh cli
 ```
 
-## 预期输出
+CLI 中可运行 `pingall`，三个主机间应全部连通。ECMP 的测试目的地址为 `10.0.0.100` 等非主机地址，测试通过原始报文抓包核对结果。
 
-```
-    controller: 10.0.0.0/24 -> ecmp group(base=0, count=2)
-    controller: ecmp_nhop[0] -> port 2 mac 00:00:00:00:00:02
-    controller: ecmp_nhop[1] -> port 3 mac 00:00:00:00:00:03
-    controller: ecmp ready: 3 direct routes + 2-way ECMP group
-h2 received: 10/20
-h3 received: 10/20
-SUCCESS: ECMP distributed 20/20 flows across both members
+默认测试的输出示例：
+
+```text
+protocol=17: h2=30 h3=30
+protocol=6: h2=30 h3=30
+SUCCESS: 243 ECMP and IPv4 packets follow expected paths and contents
 ```
 
-具体数字会因 hash 种子略有浮动(CRC-16 对连续 sport 常常 50/50 均分,其它序列可能偏斜)。
+成员分布由输入五元组和 CRC16 决定，不要求任意流量集合都平均分配。
 
-## 延伸
+在仓库根目录运行相关回归测试：
 
-- **增加 ECMP 成员数**:改控制器中的 `ecmp_count` + 增加 `ecmp_nhop` 条目。
-- **加权 ECMP**:给"更重"的下一跳在 `ecmp_nhop` 里重复几个索引(WCMP,Weighted)。
-- **故障切换**:检测某路径 down 后把 `ecmp_count` 从 2 改回 1(MODIFY `ipv4_lpm` 条目)。
+```bash
+/usr/bin/python3 -m unittest discover -s tests -p test_ecmp.py -v
+```
+
+## 文件说明
+
+| 文件                 | 用途                                           |
+| -------------------- | ---------------------------------------------- |
+| `main.p4`            | IPv4 解析、校验、路由和 ECMP 选择              |
+| `controller/main.go` | 安装 pipeline、直达路由和 ECMP 成员            |
+| `topology.py`        | 创建拓扑、配置静态邻居、管理测试进程并核对交付 |
+| `packets.py`         | 生成测试报文、计算 CRC16 和完整输出报文        |
+| `probe.py`           | 发送报文清单并抓取带测试标记的入向报文         |
+| `run.sh`             | 编译、启动、验证和资源清理                     |
+
+## 扩展
+
+增加成员时，需要同时调整 `ecmp_count` 和 `ecmp_nhop` 表项。加权 ECMP 可以让多个索引指向同一成员。改变成员集合可能改变已有流的路径，当前哈希不保证成员变更后的路径稳定。
