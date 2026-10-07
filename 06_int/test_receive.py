@@ -1,86 +1,94 @@
 #!/usr/bin/env python3
-"""Sniff on h2-eth0 for the INT UDP packet and report the parsed INT
-stack. Exit 0 printing SUCCESS when the packet carries >= 2 INT
-headers with swid == {1, 2} (s1 and s2 on the expected path)."""
+"""Capture labelled IPv4 frames or validate the standalone h1-to-h2 INT demo."""
 
 from __future__ import annotations
 
-import sys
+import argparse
+import ipaddress
+import json
+from pathlib import Path
+import socket
+import tempfile
 import time
 
-from scapy.fields import BitField, FieldLenField, PacketListField, ShortField
-from scapy.layers.inet import IP, IPOption, _IPOption_HDR
-from scapy.layers.l2 import Ether
-from scapy.packet import Packet
-from scapy.sendrecv import AsyncSniffer
-
-IFACE = "h2-eth0"
-TIMEOUT = 5.0
-
-
-class SwitchTrace(Packet):
-    fields_desc = [
-        BitField("swid", 0, 13),
-        BitField("qdepth", 0, 13),
-        BitField("portid", 0, 6),
-    ]
-
-    def extract_padding(self, p):
-        return b"", p
-
-
-class IPOption_INT(IPOption):
-    name = "INT"
-    option = 31
-    fields_desc = [
-        _IPOption_HDR,
-        FieldLenField("length", None, fmt="B",
-                      length_of="int_headers",
-                      adjust=lambda _, length: length * 2 + 4),
-        ShortField("count", 0),
-        PacketListField("int_headers", [], pkt_cls=SwitchTrace,
-                        count_from=lambda pkt: pkt.count),
-    ]
+if __package__:
+    from .packets import (
+        HOST_IPS,
+        PATHS,
+        check_forwarded,
+        int_option,
+        make_frame,
+        parse_frame,
+    )
+else:
+    from packets import (
+        HOST_IPS,
+        PATHS,
+        check_forwarded,
+        int_option,
+        make_frame,
+        parse_frame,
+    )
 
 
-def has_udp_4321(pkt):
-    return IP in pkt and pkt[IP].proto == 17 and bytes(pkt[IP].payload)[:2] == b"\x10\xe1"  # sport 4321
+def receive_frames(
+    iface: str, prefix: str, seconds: float, ready: str, limit: int | None = None
+) -> list[bytes]:
+    marker = bytes.fromhex(prefix)
+    if len(marker) != 3:
+        raise ValueError("capture prefix must contain three IPv4 source bytes")
+    frames = []
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as sock:
+        sock.bind((iface, 0))
+        Path(ready).write_text("ready\n")
+        if limit is not None:
+            print(f"receiver ready on {iface}", flush=True)
+        deadline = time.monotonic() + seconds
+        while (remaining := deadline - time.monotonic()) > 0:
+            sock.settimeout(remaining)
+            try:
+                frame, address = sock.recvfrom(65549)
+            except socket.timeout:
+                break
+            if address[2] != socket.PACKET_OUTGOING and frame[26:29] == marker:
+                frames.append(frame)
+                if limit is not None and len(frames) >= limit:
+                    break
+    return frames
 
 
 def main() -> int:
-    sniffer = AsyncSniffer(iface=IFACE, filter="udp and port 4321",
-                           count=1, timeout=TIMEOUT)
-    sniffer.start()
-    time.sleep(0.1)
-    sniffer.join(timeout=TIMEOUT + 0.5)
-    pkts = sniffer.results or []
-    if not pkts:
-        print(f"FAILURE: no UDP packet received on {IFACE} within {TIMEOUT}s")
-        return 1
-
-    pkt = pkts[0]
-    print(f"received: src={pkt[Ether].src} dst={pkt[Ether].dst}")
-    ip = pkt[IP]
-    print(f"IP: {ip.src} -> {ip.dst} ihl={ip.ihl}")
-    if ip.ihl <= 5 or not ip.options:
-        print("FAILURE: packet has no IP options — switches did not append INT headers")
-        return 1
-
-    int_opt = next((o for o in ip.options if isinstance(o, IPOption_INT)), None)
-    if int_opt is None:
-        print("FAILURE: IP option is not INT")
-        return 1
-
-    print(f"INT count={int_opt.count}")
-    for stanza in int_opt.int_headers:
-        print(f"  swid={stanza.swid} qdepth={stanza.qdepth} portid={stanza.portid}")
-
-    swids = [s.swid for s in int_opt.int_headers]
-    if int_opt.count >= 2 and 1 in swids and 2 in swids:
-        print("SUCCESS: INT stack carries s1 and s2 traces")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iface", default="h2-eth0")
+    parser.add_argument("--prefix")
+    parser.add_argument("--seconds", type=float, default=4)
+    parser.add_argument("--ready")
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix="p4-int-receiver-") as directory:
+        source = ipaddress.IPv4Address(HOST_IPS[1]).packed
+        frames = receive_frames(
+            args.iface,
+            args.prefix or source[:3].hex(),
+            args.seconds,
+            args.ready or str(Path(directory) / "ready"),
+            limit=None if args.prefix is not None else 1,
+        )
+    if args.prefix is not None:
+        print(json.dumps({"frames": [frame.hex() for frame in frames]}), flush=True)
         return 0
-    print(f"FAILURE: expected INT stack to include swid 1 and 2, got {swids}")
-    return 1
+    try:
+        if len(frames) != 1:
+            raise RuntimeError(f"expected one demo frame, received {len(frames)}")
+        check_forwarded(
+            make_frame(source, 1, 2, int_option([])), frames[0], PATHS[1, 2]
+        )
+        for swid, depth, port in parse_frame(frames[0])["traces"]:
+            print(f"swid={swid} qdepth={depth} portid={port}")
+    except RuntimeError as exc:
+        print(f"FAILURE: {exc}")
+        return 1
+    print("SUCCESS: complete INT packet carries the expected s1 and s2 traces")
+    return 0
 
 
 if __name__ == "__main__":

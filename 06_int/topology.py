@@ -17,10 +17,15 @@ in parallel.
 from __future__ import annotations
 
 import argparse
+import importlib
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
@@ -31,6 +36,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from common.p4switch import P4RuntimeSwitch, reset_port_allocators  # noqa: E402
 from common.runtime import Controller, NetworkRuntime  # noqa: E402
+
+packets = importlib.import_module("06_int.packets")
 
 
 HOSTS = [
@@ -101,17 +108,193 @@ def wait_all_ready(procs: list[Controller], timeout: float = 20.0) -> bool:
 
 
 def populate_arp(net: Mininet) -> None:
-    """Static ARP entries so hosts don't need to resolve. We map every
-    other host's IP to that host's MAC."""
-    info("*** Populating static ARP\n")
-    for name, ip, _mac in HOSTS:
+    """Configure routes and static neighbours in each host namespace."""
+    info("*** Configuring host routes and static ARP\n")
+    for name, _ip, _mac in HOSTS:
         host = net.get(name)
+        iface = host.defaultIntf().name
+        commands = [["ip", "route", "replace", "default", "dev", iface]]
         for other, other_ip, other_mac in HOSTS:
             if other == name:
                 continue
-            # other_ip is e.g. "10.0.3.4/24"; strip the /prefix.
             target_ip = other_ip.split("/")[0]
-            host.cmd(f"arp -s {target_ip} {other_mac}")
+            commands.append(
+                [
+                    "ip",
+                    "neigh",
+                    "replace",
+                    target_ip,
+                    "lladdr",
+                    other_mac,
+                    "nud",
+                    "permanent",
+                    "dev",
+                    iface,
+                ]
+            )
+        for command in commands:
+            output, error, code = host.pexec(command)
+            if code:
+                raise RuntimeError(f"cannot configure {name}: {output} {error}")
+
+
+def read_probe(proc: subprocess.Popen, timeout: float = 6) -> dict:
+    output, error = proc.communicate(timeout=timeout)
+    if proc.returncode:
+        raise RuntimeError(f"packet probe failed: {output.strip()} {error.strip()}")
+    try:
+        reply = json.loads(output)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("packet probe returned invalid JSON") from exc
+    if not isinstance(reply, dict):
+        raise RuntimeError("packet probe reply must be an object")
+    return reply
+
+
+def frame_list(reply: dict) -> list[bytes]:
+    frames = reply.get("frames")
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, str) for frame in frames
+    ):
+        raise RuntimeError("capture reply must contain frame hex strings")
+    try:
+        return [bytes.fromhex(frame) for frame in frames]
+    except ValueError as exc:
+        raise RuntimeError("capture reply contains invalid frame bytes") from exc
+
+
+def stop_probe(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def check_delivery(probes: list[dict], received: dict[str, list[bytes]]) -> None:
+    if set(received) != {"h1", "h2", "h3", "h4"}:
+        raise RuntimeError("capture replies must include all four hosts")
+    identities = {item["frame"][26:30]: item for item in probes}
+    if len(identities) != len(probes):
+        raise RuntimeError("test packets must have unique IPv4 sources")
+    arrivals = {key: [] for key in identities}
+    for host, frames in received.items():
+        if not isinstance(frames, list):
+            raise RuntimeError("capture replies must contain frame lists")
+        for frame in frames:
+            if (
+                not isinstance(frame, bytes)
+                or len(frame) < 30
+                or frame[26:30] not in identities
+            ):
+                raise RuntimeError(
+                    "capture contains an unrecognised or incomplete frame"
+                )
+            arrivals[frame[26:30]].append((host, frame))
+    for identity, item in identities.items():
+        actual = arrivals[identity]
+        expected = 1 if item["allowed"] else 0
+        if len(actual) != expected:
+            raise RuntimeError(
+                f"{item['name']} received {len(actual)} frames, expected {expected}"
+            )
+        if actual:
+            host, frame = actual[0]
+            if host != item["receiver"]:
+                raise RuntimeError(f"{item['name']} arrived at the wrong host")
+            packets.check_forwarded(item["frame"], frame, item["path"])
+        print(f"{item['name']}: received={len(actual)}, expected={expected}")
+
+
+def run_test(net: Mininet, controllers: list[Controller]) -> int:
+    procs = []
+    try:
+        if any(ctrl.proc.poll() is not None for ctrl in controllers):
+            raise RuntimeError("controller exited before the INT test")
+        prefix = bytes((198, 18)) + uuid.uuid4().bytes[:1]
+        probes = packets.make_probes(prefix)
+        with tempfile.TemporaryDirectory(prefix="p4-int-") as directory:
+            receivers = {}
+            for name, _, _ in HOSTS:
+                host = net.get(name)
+                ready = Path(directory) / f"{name}-ready"
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/test_receive.py",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--prefix",
+                        prefix.hex(),
+                        "--ready",
+                        str(ready),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                receivers[name] = (proc, ready)
+            deadline = time.monotonic() + 3
+            while not all(
+                ready.exists() and ready.read_text() == "ready\n"
+                for _, ready in receivers.values()
+            ):
+                if time.monotonic() >= deadline or any(
+                    proc.poll() is not None for proc, _ in receivers.values()
+                ):
+                    raise RuntimeError("packet receivers did not become ready")
+                time.sleep(0.02)
+            for name, _, _ in HOSTS:
+                sent = [item["frame"] for item in probes if item["sender"] == name]
+                manifest = Path(directory) / f"{name}.json"
+                manifest.write_text(json.dumps([frame.hex() for frame in sent]))
+                host = net.get(name)
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/test_send.py",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--frames",
+                        str(manifest),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                reply = read_probe(proc)
+                if type(reply.get("sent")) is not int or reply["sent"] != len(sent):
+                    raise RuntimeError("sender did not confirm all test frames")
+            captured = {
+                name: frame_list(read_probe(proc))
+                for name, (proc, _) in receivers.items()
+            }
+        check_delivery(probes, captured)
+        if any(ctrl.proc.poll() is not None for ctrl in controllers):
+            raise RuntimeError("controller exited during the INT test")
+    except (
+        RuntimeError,
+        OSError,
+        ValueError,
+        TypeError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        print(f"FAILURE: {exc}")
+        return 1
+    finally:
+        for proc in procs:
+            stop_probe(proc)
+    print(
+        f"SUCCESS: {len(probes)} INT and IPv4 cases preserve complete packets and expected paths"
+    )
+    return 0
 
 
 def main() -> None:
@@ -144,28 +327,8 @@ def main() -> None:
             print("!!! at least one controller failed to become ready")
             sys.exit(2)
 
-        rc = 0
-        if args.run_test:
-            h1 = net.get("h1")
-            h2 = net.get("h2")
-            info("*** Sending INT-carrying UDP packet h1 -> h2\n")
-            # Start receiver on h2
-            rx = h2.popen(
-                ["python3", f"{HERE}/test_receive.py"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-            time.sleep(1.0)
-            # Send from h1
-            h1.cmd(f"python3 {HERE}/test_send.py")
-            try:
-                out, _ = rx.communicate(timeout=6)
-            except subprocess.TimeoutExpired:
-                rx.kill()
-                out, _ = rx.communicate()
-            sys.stdout.write(out.decode(errors="replace"))
-            rc = 0 if b"SUCCESS" in out else 1
-        else:
+        rc = run_test(net, controllers) if args.run_test else 0
+        if not args.run_test:
             CLI(net)
 
     sys.exit(rc)

@@ -1,143 +1,100 @@
-# 🛰️ Case 06 · 带内网络遥测(INT)
+# Case 06：带内网络遥测
 
-> **学习目标**: 多交换机(3 台)转发 + **IPv4 Options** 承载的 INT 元数据。数据面在转发时**顺手注入自己的 swid / 队列深度 / 出端口**,控制面只负责"装好表,其他我不管"。
+本案例用三台交换机进行 IPv4 路由，并在携带 INT Option 的报文中记录交换机编号、队列深度和出端口。控制器安装路由表，并为每台交换机配置追加记录的默认动作。
 
 ## 拓扑
 
-```
-            h4
-             │
-             │
+```text
 h1 ── s1 ── s3 ── h3
-      │
-      s2
+      │     │
+      s2    h4
       │
       h2
 ```
 
-端口编号(与 `controller/main.go` 里的 `switchConfig` 一致):
+| 交换机 | 端口 1 | 端口 2 | 端口 3 |
+| ------ | ------ | ------ | ------ |
+| s1     | h1     | s2     | s3     |
+| s2     | h2     | s1     | 无     |
+| s3     | h3     | h4     | s1     |
 
-| 交换机 | port 1 | port 2 | port 3 |
-| --- | --- | --- | --- |
-| s1 | h1  | s2   | s3   |
-| s2 | h2  | s1   | —    |
-| s3 | h3  | h4   | s1   |
+| 主机 | IP       | MAC               |
+| ---- | -------- | ----------------- |
+| h1   | 10.0.1.1 | 00:00:0a:00:01:01 |
+| h2   | 10.0.2.2 | 00:00:0a:00:02:02 |
+| h3   | 10.0.3.3 | 00:00:0a:00:03:03 |
+| h4   | 10.0.3.4 | 00:00:0a:00:03:04 |
 
-IP / MAC:
+拓扑为主机配置默认路由和静态邻居条目，让不同子网之间的普通 IPv4 流量也能往返。每台交换机使用独立的 BMv2 实例，gRPC 端口依次为 9559、9560、9561。
 
-| 主机 | IP | MAC |
-| --- | --- | --- |
-| h1 | 10.0.1.1 | 00:00:0a:00:01:01 |
-| h2 | 10.0.2.2 | 00:00:0a:00:02:02 |
-| h3 | 10.0.3.3 | 00:00:0a:00:03:03 |
-| h4 | 10.0.3.4 | 00:00:0a:00:03:04 |
+## 报文格式
 
-## 功能
+这是教学用的私有 INT 格式。它使用 IPv4 Option number 31，占用完整的 Options 区域。Option 类型字节为 `0x1f`，也接受设置了复制标志的 `0x9f`。
 
-- 每台交换机是**IPv4 LPM 路由器**:匹配目的 IP 前缀 → 重写 dst MAC + 设置 egress。
-- 若数据包**携带 INT IPv4 Option**(option number 31),egress pipeline **追加**一段 `SwitchTrace(swid, qdepth, portid)`。多跳之后接收端能看到完整路径。
-- h1 → h2 途中经过 s1 和 s2,接收方看到 INT 栈包含 2 条(s1 和 s2 的 swid)。
+| 字段        | 长度   | 含义                                       |
+| ----------- | ------ | ------------------------------------------ |
+| Option 类型 | 1 字节 | 复制标志、类别和编号                       |
+| Option 长度 | 1 字节 | `4 + 4 × 记录数`                           |
+| 记录数      | 2 字节 | 已有记录的数量                             |
+| 每条记录    | 4 字节 | 13 位交换机编号、13 位队列深度、6 位出端口 |
+
+空 INT Option 长 4 字节，IPv4 的 IHL 为 6。每新增一条记录，IHL 增加 1，Option 长度和 IP 总长度各增加 4 字节。IPv4 头最多为 60 字节，因此最多容纳 9 条记录。
+
+记录通过 `push_front` 添加，最新一跳排在最前面。例如 h2 到 h4 依次经过 s2、s1、s3，接收端读到的新增记录依次为 s3、s1、s2。
+
+## 转发与边界
+
+- 先检查 IPv4 版本、IHL、总长度和完整头部的校验和，再查 LPM 路由
+- 每次转发重写以太网地址并将 TTL 减 1，TTL 不足、无路由或报文格式异常时丢弃
+- 追加记录前检查容量和 IP 总长度，达到 9 条或无法再容纳 4 字节时保留已有内容并继续转发
+- INT 的记录数、Option 长度和 IHL 必须一致，声明过多记录或长度不匹配时丢弃
+- 普通 IPv4 Options 按原字节保留，传输层内容不参与 INT 解析
+
+本案例只追加位于 Options 起始位置、独占 Options 区域的 INT 记录。Options 不以 INT 类型开头时整体保留，不扫描其中的 INT 字节。IPv4 分片按同样的路由规则转发，负载保持原样。
+
+校验和计算覆盖完整 IPv4 头，包括实际存在的 Options 和 INT 记录。代码分别处理 0 到 9 条记录，避免把未出现在报文中的无效栈元素加入计算。
 
 ## 文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `main.p4` | 完整 INT pipeline(带 ingress LPM 路由 + egress INT 注入 + IPv4 checksum 重算) |
-| `topology.py` | 3 交换机 4 主机拓扑,并行拉起 3 个 BMv2 实例(9559/9560/9561) |
-| `controller/main.go` | 单一 Go 程序,用 `-switch-id` 区分 s1/s2/s3,各自装不同的 LPM 表和 `int_table` 默认动作 |
-| `test_send.py` | h1 发一个预封装了空 INT option 的 UDP 包 |
-| `test_receive.py` | h2 捕获并解析 INT 栈,验证含 s1 + s2 |
-| `run.sh` | 编译 + 3 控制器并行 + 自动验证 |
-
-## P4 要点
-
-INT 头的"逐跳追加"靠 egress:
-
-```p4
-action add_int_header(switch_id_t swid){
-    hdr.int_count.num_switches = hdr.int_count.num_switches + 1;
-    hdr.int_headers.push_front(1);
-    hdr.int_headers[0].setValid();
-    hdr.int_headers[0].switch_id  = (bit<13>)swid;
-    hdr.int_headers[0].queue_depth = (bit<13>)standard_metadata.deq_qdepth;
-    hdr.int_headers[0].output_port = (bit<6>) standard_metadata.egress_port;
-    hdr.ipv4.ihl = hdr.ipv4.ihl + 1;
-    hdr.ipv4.totalLen = hdr.ipv4.totalLen + 4;
-    hdr.ipv4_option.optionLength = hdr.ipv4_option.optionLength + 4;
-}
-
-table int_table {
-    actions = { add_int_header; NoAction; }
-    default_action = NoAction();       // 控制器把它改成 add_int_header(我的 swid)
-}
-```
-
-## Go 控制器要点
-
-同一二进制,三份配置:
-
-```go
-func configFor(switchID uint64) switchConfig {
-    switch switchID {
-    case 1: return switchConfig{
-        deviceID: 1, switchID: 1,
-        lpm: []lpmEntry{
-            {"10.0.1.1", 32, "00:00:0a:00:01:01", 1},
-            {"10.0.2.2", 32, "00:01:0a:00:02:02", 2},
-            {"10.0.3.0", 24, "00:00:00:03:01:00", 3},
-        }}
-    case 2: ...
-    case 3: ...
-    }
-}
-```
-
-动态改**表默认动作**:
-
-```go
-defInt, _ := tableentry.NewBuilder(p, "MyEgress.int_table").
-    AsDefault().
-    Action("MyEgress.add_int_header",
-        tableentry.Param("swid", codec.MustEncodeUint(cfg.switchID, 13))).
-    Build()
-c.WriteTableEntry(ctx, client.UpdateModify, defInt)   // 注意是 MODIFY
-```
-
-(P4Runtime 约定:写默认动作用 `MODIFY`,不是 `INSERT`。)
+| 文件                 | 作用                                              |
+| -------------------- | ------------------------------------------------- |
+| `main.p4`            | IPv4 解析、校验、路由、追加记录和校验和更新       |
+| `controller/main.go` | 按交换机编号安装路由，并配置 INT 默认动作         |
+| `packets.py`         | 生成报文、编码 INT 记录和核对完整转发结果         |
+| `topology.py`        | 启动网络和控制器，配置主机并运行自动验证          |
+| `test_send.py`       | 发送测试清单，默认发送 h1 到 h2 的单个空 INT 报文 |
+| `test_receive.py`    | 捕获本轮报文，默认核对 h1 到 h2 的单包演示        |
+| `run.sh`             | 编译并启动自动测试或 Mininet CLI                  |
 
 ## 运行
 
+在本目录执行：
+
 ```bash
-sudo ./run.sh          # 自动 send/receive 测试
-sudo ./run.sh cli      # 进 mininet CLI 自己玩(h1 可以 ping h2)
+sudo ./run.sh
+sudo ./run.sh cli
 ```
 
-## 预期输出
+在 CLI 中执行 `pingall` 可检查四台主机的连通性。单包演示可先执行 `h2 python3 test_receive.py --seconds 30 &`，看到 `receiver ready` 后执行 `h1 python3 test_send.py`。接收脚本会检查完整报文和预期的两跳记录。
 
+控制器根据 `-switch-id` 选择配置。`ipv4_lpm` 的默认动作是丢弃，`int_table` 的默认动作是 `MyEgress.add_int_header`。修改默认动作使用 P4Runtime 的 `MODIFY`。
+
+## 自动验证
+
+自动测试发送 63 帧，每帧使用不同的 IPv4 源地址作为标记，并在四台主机上捕获报文。检查项包括：
+
+- 四台主机之间全部 12 个方向的普通 IPv4 和 INT 流量
+- 已有 0 到 9 条记录时的追加、顺序、出端口和原有记录保留
+- 普通 Options、复制标志、分片和不透明负载的完整保留
+- 正常 TTL、逐跳耗尽、未知路由、错误校验和及格式异常报文
+- 接收 IP 总长度为 1500 字节时的完整交付
+
+每个允许的报文必须恰好到达指定主机一次。测试检查整个报文，包括以太网地址、IHL、总长度、TTL、校验和、INT 记录和原始负载。新增记录的队列深度由交换机实际采样，已有记录必须原样保留。被丢弃的报文不能出现在任何主机的捕获结果中。
+
+收发进程通过就绪标记同步，进程错误、超时、报文丢失、重复或内容变化都会使测试退出。退出时清理本次启动的收发进程、控制器和网络。
+
+成功时输出：
+
+```text
+SUCCESS: 63 INT and IPv4 cases preserve complete packets and expected paths
 ```
-    ctrl1: s1 ready
-    ctrl2: s2 ready
-    ctrl3: s3 ready
-*** Sending INT-carrying UDP packet h1 -> h2
-received: src=00:01:0a:00:02:02 dst=00:00:0a:00:02:02
-IP: 0.0.0.0 -> 10.0.2.2 ihl=8
-INT count=2
-  swid=2 qdepth=0 portid=1
-  swid=1 qdepth=0 portid=2
-SUCCESS: INT stack carries s1 and s2 traces
-```
-
-INT 栈的顺序是**倒序**:`swid=2` 在前(最新 push,即 s2 egress),`swid=1` 在后(更早 push,s1 egress)。这是 `push_front` 造成的,符合规范。
-
-## 故障排查
-
-**INT 栈只有 1 条**:  
-某台交换机的 `int_table default_action` 没设成 `add_int_header`。检查控制器日志,确认 3 个 "int_table default = add_int_header(swid=N)" 都出现。
-
-**`SUCCESS` 失败并打出"no UDP packet received"**:  
-静态 ARP 或 LPM 某条配错了。按日志看哪一跳丢。用 `sudo ./run.sh cli` 进入 mininet,在 h1 上 `tcpdump -i h1-eth0`,在 h2 上也 tcpdump,对比看包停在哪一跳。
-
-## 延伸
-
-- 真实 INT 规范(INT-MD)要复杂得多——本案例是最简化的"教学 INT"。想做生产级可以参考 `p4lang/p4app-int` 或 `hyperxpro/in-band-network-telemetry`。
-- 本案例**不统计 qdepth / latency**;仅记录 swid + port。加上时间戳字段就是一个完整的 P-Telemetry 基座。
