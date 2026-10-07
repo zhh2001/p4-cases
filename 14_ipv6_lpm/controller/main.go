@@ -2,14 +2,13 @@
 //
 // Installs four entries in MyIngress.ipv6_lpm:
 //
-//   2001:db8:1::/64    -> port 1, dstMac 00:00:00:00:00:01 (h1)
-//   2001:db8:2::/64    -> port 2, dstMac 00:00:00:00:00:02 (h2)
-//   2001:db8:3::/64    -> port 3, dstMac 00:00:00:00:00:03 (h3)
-//   2001:db8:3::1/128  -> port 3, dstMac 00:00:00:00:00:03 (h3)
+//	2001:db8:1::/64    -> port 1, dstMac 00:00:00:00:00:01 (h1)
+//	2001:db8:2::/64    -> port 2, dstMac 00:00:00:00:00:02 (h2)
+//	2001:db8:3::/64    -> port 3, dstMac 00:00:00:00:00:03 (h3)
+//	2001:db8:3::42/128 -> port 2, dstMac 00:00:00:00:00:02 (h2)
 //
-// The /128 entry is intentionally a duplicate-by-next-hop of the /64
-// it shadows — its only purpose is to demonstrate that BMv2 hits the
-// longer prefix first when multiple LPM entries match.
+// The /128 has a different next hop from its parent /64, making the
+// longest-prefix decision visible in the receiving host and MAC.
 package main
 
 import (
@@ -89,7 +88,7 @@ func main() {
 		{"2001:db8:1::", 64, "00:00:00:00:00:01", 1, "h1 /64"},
 		{"2001:db8:2::", 64, "00:00:00:00:00:02", 2, "h2 /64"},
 		{"2001:db8:3::", 64, "00:00:00:00:00:03", 3, "h3 /64"},
-		{"2001:db8:3::1", 128, "00:00:00:00:00:03", 3, "h3 /128 (more specific)"},
+		{"2001:db8:3::42", 128, "00:00:00:00:00:02", 2, "h2 /128 override"},
 	}
 
 	for _, r := range routes {

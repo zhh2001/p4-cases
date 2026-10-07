@@ -2,38 +2,31 @@
 /*
  * Case 14: IPv6 LPM routing.
  *
- * Single-stage IPv6 router. The match-action table `ipv6_lpm` keys on
- * `hdr.ipv6.dstAddr` with LPM (longest-prefix-match) — the same kind
- * of lookup a real router does on the FIB. The matching action is
- * `ipv6_forward(dstMac, port)`, which:
+ * Match destination addresses by longest prefix, rewrite both MACs
+ * and decrement hopLimit once. Drop parser errors, non-IPv6 frames,
+ * expired packets and destinations without a route.
  *
- *   - decrements hopLimit (with a runtime check: 0 -> drop)
- *   - rewrites ethernet.srcAddr with the previous dstAddr (the router
- *     "owns" that gateway MAC, so on the way out it becomes the src)
- *   - rewrites ethernet.dstAddr with the next-hop MAC the controller
- *     installed alongside the prefix
- *   - sets egress_spec to the egress port for that next hop
- *
- * Why LPM matters here: with IPv4 you most often see /24 or /32 in
- * teaching examples, so the "longest prefix wins" logic is easy to
- * mentally simulate. With IPv6 the prefix-match width balloons to 128
- * bits, which forces P4's match engine to be parametric in width —
- * the same `lpm` keyword works unchanged. The controller installs:
+ * The controller installs:
  *
  *     2001:db8:1::/64  -> port 1, h1
  *     2001:db8:2::/64  -> port 2, h2
  *     2001:db8:3::/64  -> port 3, h3
- *     2001:db8:3::1/128 -> port 3, h3   (same destination, longer prefix)
+ *     2001:db8:3::42/128 -> port 2, h2
  *
- * The /128 is redundant in next-hop terms but exercises the "longer
- * prefix takes precedence" rule — a packet to 2001:db8:3::1 hits the
- * /128, packets to any other 2001:db8:3::/64 host hit the /64.
+ * The /128 uses a different next hop, so its precedence is observable.
+ * Other destinations in 2001:db8:3::/64, including h3, use port 3.
+ * Extension headers and transport data remain in the unparsed payload.
  */
 
 #include <core.p4>
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV6 = 0x86dd;
+
+error {
+    InvalidIPv6Version,
+    InvalidIPv6Length
+}
 
 typedef bit<9>   egressSpec_t;
 typedef bit<48>  macAddr_t;
@@ -76,6 +69,9 @@ parser MyParser(packet_in packet,
     }
     state parse_ipv6 {
         packet.extract(hdr.ipv6);
+        verify(hdr.ipv6.version == 6, error.InvalidIPv6Version);
+        verify((bit<32>)hdr.ipv6.payloadLen <= standard_metadata.packet_length - 54,
+               error.InvalidIPv6Length);
         transition accept;
     }
 }
@@ -105,12 +101,16 @@ control MyIngress(inout headers hdr,
     }
 
     apply {
-        if (hdr.ipv6.isValid() && hdr.ipv6.hopLimit > 1) {
-            ipv6_lpm.apply();
-        } else if (hdr.ipv6.isValid()) {
-            // hopLimit == 0 or 1 -> would underflow on decrement. drop.
+        if (standard_metadata.parser_error != error.NoError ||
+            !hdr.ipv6.isValid()) {
             drop();
+            return;
         }
+        if (hdr.ipv6.hopLimit <= 1) {
+            drop();
+            return;
+        }
+        ipv6_lpm.apply();
     }
 }
 

@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
-"""Mininet topology for Case 14: IPv6 LPM routing.
-
-Three hosts, each in their own /64. The switch routes between them via
-an LPM table installed by the Go controller.
-
-Test plan (scapy bypasses host kernel, so we don't have to wrestle
-with Mininet's IPv6 routing tables):
-
-  flow A: h1 -> 2001:db8:2::1   should reach h2 only       (/64 hit)
-  flow B: h1 -> 2001:db8:3::1   should reach h3 only       (/128 wins)
-  flow C: h1 -> 2001:db8:3::42  should reach h3 only       (/64 fallback)
-  flow D: h1 -> 2001:db8:9::1   should reach nobody        (no entry -> drop)
-
-Each received packet is also checked for hopLimit == 63 (was 64,
-decremented once by ipv6_forward) and the dst-MAC rewritten to the
-target host's MAC.
-"""
+"""Validate IPv6 LPM routing, complete frames and explicit drop cases."""
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import importlib
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
@@ -32,43 +22,61 @@ from mininet.topo import Topo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.p4switch import P4RuntimeSwitch, reset_port_allocators  # noqa: E402
 from common.runtime import Controller, NetworkRuntime  # noqa: E402
 
-
-# Gateway MAC each host puts in the dst field of outgoing frames.
-# The router rewrites src/dst MACs as part of forwarding.
-GATEWAY_MAC = "00:00:00:00:0a:01"
+packets = importlib.import_module("14_ipv6_lpm.packets")
 
 
 class IPv6Topo(Topo):
     def build(self, **_opts) -> None:
         sw = self.addSwitch("s1", cls=P4RuntimeSwitch, device_id=1)
-        h1 = self.addHost("h1", ip=None, mac="00:00:00:00:00:01")
-        h2 = self.addHost("h2", ip=None, mac="00:00:00:00:00:02")
-        h3 = self.addHost("h3", ip=None, mac="00:00:00:00:00:03")
-        self.addLink(h1, sw)
-        self.addLink(h2, sw)
-        self.addLink(h3, sw)
+        for number in packets.HOST_MACS:
+            host = self.addHost(
+                f"h{number}", ip=None, mac=packets.HOST_MACS[number].hex(":")
+            )
+            self.addLink(host, sw)
+
+
+def checked_command(node, command: list[str]) -> None:
+    output, error, code = node.pexec(command)
+    if code:
+        raise RuntimeError(
+            f"interface command failed: {output.strip()} {error.strip()}"
+        )
 
 
 def configure_ipv6(net: Mininet) -> None:
-    """Assign fixed IPv6 addresses; raw scapy bypasses kernel routes,
-    but we still need each host to recognise its address so the
-    interface comes up and we can sniff with the right filters."""
-    plan = [
-        ("h1", "h1-eth0", "2001:db8:1::1/64"),
-        ("h2", "h2-eth0", "2001:db8:2::1/64"),
-        ("h3", "h3-eth0", "2001:db8:3::1/64"),
-    ]
-    for hname, iface, addr in plan:
-        h = net.get(hname)
-        # Disable IPv6 DAD — it delays address availability by 1s+.
-        h.cmd(f"sysctl -w net.ipv6.conf.{iface}.dad_transmits=0 >/dev/null")
-        h.cmd(f"sysctl -w net.ipv6.conf.{iface}.accept_dad=0   >/dev/null")
-        h.cmd(f"ip -6 addr add {addr} dev {iface}")
-    # Give the interfaces a moment to settle.
-    time.sleep(0.5)
+    """Configure addresses for interactive use without waiting for DAD."""
+    for number, address in packets.HOST_ADDRESSES.items():
+        host = net.get(f"h{number}")
+        iface = host.defaultIntf().name
+        checked_command(
+            host,
+            [
+                "sysctl",
+                "-q",
+                "-w",
+                f"net.ipv6.conf.{iface}.disable_ipv6=0",
+                f"net.ipv6.conf.{iface}.dad_transmits=0",
+                f"net.ipv6.conf.{iface}.accept_dad=0",
+            ],
+        )
+        checked_command(
+            host, ["ip", "-6", "addr", "replace", f"{address}/64", "dev", iface]
+        )
+
+
+def configure_test_interfaces(net: Mininet) -> None:
+    # Raw Ethernet probes do not need kernel IPv6 responses or neighbour discovery.
+    for name in ("h1", "h2", "h3", "s1"):
+        node = net.get(name)
+        settings = [
+            f"net.ipv6.conf.{intf.name}.disable_ipv6=1"
+            for intf in node.intfList()
+            if intf.name != "lo"
+        ]
+        checked_command(node, ["sysctl", "-q", "-w", *settings])
 
 
 def run_controller(
@@ -84,7 +92,7 @@ def run_controller(
             p4info,
             "-config",
             config,
-        ],
+        ]
     )
 
 
@@ -92,132 +100,166 @@ def wait_ready(proc: Controller, timeout: float = 15.0) -> bool:
     return proc.wait_ready("ipv6 router ready", timeout)
 
 
-def probe(
-    net: Mininet, dst_addr: str, target_iface: str, target_mac: str, n: int = 5
-) -> int:
-    """h1 sends n IPv6 packets to dst_addr. Sniff on target_iface for
-    packets that arrive with the expected dst MAC AND hopLimit==63
-    (proves both rewrite and decrement happened)."""
-    h1 = net.get("h1")
-    target_host_name = {"h2-eth0": "h2", "h3-eth0": "h3"}.get(target_iface, "h1")
-    target = net.get(target_host_name)
-
-    sniff_script = (
-        "from scapy.all import AsyncSniffer, IPv6, Ether\n"
-        f"want_mac = '{target_mac}'\n"
-        "def keep(p):\n"
-        "    if not (Ether in p and IPv6 in p):\n"
-        "        return False\n"
-        "    if p[Ether].dst.lower() != want_mac.lower():\n"
-        "        return False\n"
-        "    return p[IPv6].hlim == 63\n"
-        f"s = AsyncSniffer(iface='{target_iface}', count={n}, timeout=4, lfilter=keep)\n"
-        "s.start(); s.join()\n"
-        "print(len(s.results or []))\n"
-    )
-    rx = target.popen(
-        ["python3", "-c", sniff_script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    time.sleep(0.5)
-
-    send_script = (
-        "from scapy.all import Ether, IPv6, sendp\n"
-        f"pkt = Ether(src='{h1.MAC()}', dst='{GATEWAY_MAC}')/"
-        f"IPv6(src='2001:db8:1::1', dst='{dst_addr}', hlim=64)/b'ipv6-lpm-probe'\n"
-        f"sendp([pkt]*{n}, iface='h1-eth0', verbose=False)\n"
-    )
-    h1.cmd(f'python3 -c "{send_script}"')
-
+def read_probe(proc: subprocess.Popen, timeout: float = 4) -> dict:
+    output, error = proc.communicate(timeout=timeout)
+    if proc.returncode:
+        raise RuntimeError(f"packet probe failed: {output.strip()} {error.strip()}")
     try:
-        out, _ = rx.communicate(timeout=6)
-    except subprocess.TimeoutExpired:
-        rx.kill()
-        out, _ = rx.communicate()
-
-    for line in reversed((out or b"").decode(errors="replace").splitlines()):
-        s = line.strip()
-        if s.isdigit():
-            return int(s)
-    return 0
+        reply = json.loads(output)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("packet probe returned invalid JSON") from exc
+    if not isinstance(reply, dict):
+        raise RuntimeError("packet probe reply must be an object")
+    return reply
 
 
-def probe_dropped(net: Mininet, dst_addr: str, n: int = 5) -> tuple[int, int]:
-    """Send n packets to a no-route dst. Confirm neither h2 nor h3
-    received any packet from this flow."""
-    h1 = net.get("h1")
-    h2 = net.get("h2")
-    h3 = net.get("h3")
+def frame_list(reply: dict) -> list[bytes]:
+    frames = reply.get("frames")
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, str) for frame in frames
+    ):
+        raise RuntimeError("capture reply must contain frame hex strings")
+    try:
+        return [bytes.fromhex(frame) for frame in frames]
+    except ValueError as exc:
+        raise RuntimeError("capture reply contains invalid frame bytes") from exc
 
-    def make_sniffer(host, iface):
-        # Match anything from h1's IPv6 src — even if the router somehow
-        # leaked the packet with wrong MAC, we'd still catch it.
-        return host.popen(
-            [
-                "python3",
-                "-c",
-                "from scapy.all import AsyncSniffer, IPv6\n"
-                f"s = AsyncSniffer(iface='{iface}', count={n}, timeout=3,\n"
-                "    lfilter=lambda p: IPv6 in p and p[IPv6].src == '2001:db8:1::1')\n"
-                "s.start(); s.join(); print(len(s.results or []))\n",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
 
-    rx2 = make_sniffer(h2, "h2-eth0")
-    rx3 = make_sniffer(h3, "h3-eth0")
-    time.sleep(0.5)
+def check_delivery(probes: list[dict], received: dict[str, list[bytes]]) -> None:
+    if set(received) != {"h1", "h2", "h3"}:
+        raise RuntimeError("capture replies must include all three hosts")
+    for name, frames in received.items():
+        expected = [
+            packets.expected_frame(item["frame"], name)
+            for item in probes
+            if item["allowed"] and item["receiver"] == name
+        ]
+        if (
+            not isinstance(frames, list)
+            or any(not isinstance(frame, bytes) for frame in frames)
+            or Counter(frames) != Counter(expected)
+        ):
+            raise RuntimeError(
+                f"{name} did not receive exactly the expected complete frames"
+            )
 
-    send_script = (
-        "from scapy.all import Ether, IPv6, sendp\n"
-        f"pkt = Ether(src='{h1.MAC()}', dst='{GATEWAY_MAC}')/"
-        f"IPv6(src='2001:db8:1::1', dst='{dst_addr}', hlim=64)/b'no-route'\n"
-        f"sendp([pkt]*{n}, iface='h1-eth0', verbose=False)\n"
-    )
-    h1.cmd(f'python3 -c "{send_script}"')
 
-    def harvest(p):
+def stop_probe(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
         try:
-            out, _ = p.communicate(timeout=5)
+            proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
-        for line in reversed((out or b"").decode(errors="replace").splitlines()):
-            s = line.strip()
-            if s.isdigit():
-                return int(s)
-        return 0
-
-    return harvest(rx2), harvest(rx3)
+            proc.kill()
+            proc.wait()
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
 
 
-def run_test(net: Mininet) -> int:
-    configure_ipv6(net)
+def run_probes(
+    net: Mininet, ctrl: Controller, prefix: bytes, probes: list[dict]
+) -> None:
+    if ctrl.proc.poll() is not None:
+        raise RuntimeError("controller exited before the IPv6 routing test")
+    procs = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="p4-ipv6-") as directory:
+            receivers = {}
+            for name in ("h1", "h2", "h3"):
+                host = net.get(name)
+                ready = Path(directory) / f"{name}-ready"
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/probe.py",
+                        "receive",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--prefix",
+                        prefix.hex(),
+                        "--ready",
+                        str(ready),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                receivers[name] = (proc, ready)
+            deadline = time.monotonic() + 2
+            while not all(
+                ready.exists() and ready.read_text() == "ready\n"
+                for _, ready in receivers.values()
+            ):
+                if time.monotonic() >= deadline or any(
+                    proc.poll() is not None for proc, _ in receivers.values()
+                ):
+                    raise RuntimeError("packet receivers did not become ready")
+                time.sleep(0.02)
+            senders = []
+            for name in ("h1", "h2", "h3"):
+                frames = [item["frame"] for item in probes if item["sender"] == name]
+                if not frames:
+                    continue
+                manifest = Path(directory) / f"{name}.json"
+                manifest.write_text(json.dumps([frame.hex() for frame in frames]))
+                host = net.get(name)
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/probe.py",
+                        "send",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--frames",
+                        str(manifest),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                senders.append((proc, len(frames)))
+            for proc, count in senders:
+                reply = read_probe(proc)
+                if type(reply.get("sent")) is not int or reply["sent"] != count:
+                    raise RuntimeError("sender did not confirm all test frames")
+            captured = {
+                name: frame_list(read_probe(proc))
+                for name, (proc, _) in receivers.items()
+            }
+        check_delivery(probes, captured)
+        if ctrl.proc.poll() is not None:
+            raise RuntimeError("controller exited during the IPv6 routing test")
+    finally:
+        for proc in procs:
+            stop_probe(proc)
 
-    info("*** flow A: h1 -> 2001:db8:2::1 (h2 /64)\n")
-    a = probe(net, "2001:db8:2::1", "h2-eth0", "00:00:00:00:00:02", n=5)
-    info("*** flow B: h1 -> 2001:db8:3::1 (h3 /128, longer prefix)\n")
-    b = probe(net, "2001:db8:3::1", "h3-eth0", "00:00:00:00:00:03", n=5)
-    info("*** flow C: h1 -> 2001:db8:3::42 (h3 /64 fallback)\n")
-    c = probe(net, "2001:db8:3::42", "h3-eth0", "00:00:00:00:00:03", n=5)
-    info("*** flow D: h1 -> 2001:db8:9::1 (no route, expect drop)\n")
-    d2, d3 = probe_dropped(net, "2001:db8:9::1", n=5)
 
-    print(f"flow A  -> h2 received: {a}/5  (want 5, hop_limit=63, dst-MAC=h2)")
-    print(f"flow B  -> h3 received: {b}/5  (want 5, /128 longer-prefix-wins)")
-    print(f"flow C  -> h3 received: {c}/5  (want 5, /64 fallback)")
-    print(f"flow D  -> h2 leaked:   {d2}/5  (want 0)")
-    print(f"flow D  -> h3 leaked:   {d3}/5  (want 0)")
-
-    if a == 5 and b == 5 and c == 5 and d2 == 0 and d3 == 0:
-        print(
-            "SUCCESS: IPv6 LPM (longer-prefix wins, hop_limit decrement, dst-MAC rewrite) all working"
-        )
-        return 0
-    print("FAILURE: IPv6 LPM behaviour does not match expectations")
-    return 1
+def run_test(net: Mininet, ctrl: Controller) -> int:
+    try:
+        if ctrl.proc.poll() is not None:
+            raise RuntimeError("controller exited before the IPv6 routing test")
+        configure_test_interfaces(net)
+        prefix = b"\x02" + uuid.uuid4().bytes[:3]
+        probes = packets.make_probes(prefix)
+        run_probes(net, ctrl, prefix, probes)
+    except (
+        RuntimeError,
+        OSError,
+        ValueError,
+        TypeError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        print(f"FAILURE: {exc}")
+        return 1
+    forwarded = sum(item["allowed"] for item in probes)
+    print(
+        f"IPv6 probes: sent={len(probes)} forwarded={forwarded} dropped={len(probes)-forwarded}"
+    )
+    print("SUCCESS: IPv6 longest-prefix routing and complete frames validated")
+    return 0
 
 
 def main() -> None:
@@ -229,21 +271,19 @@ def main() -> None:
     args = parser.parse_args()
 
     setLogLevel("info")
+    reset_port_allocators()
     with NetworkRuntime(IPv6Topo()) as runtime:
         net = runtime.net
-
         ctrl = run_controller(runtime, args.controller, args.p4info, args.config)
         if not wait_ready(ctrl):
             print("!!! controller did not reach ready state")
             sys.exit(2)
-
         rc = 0
         if args.run_test:
-            rc = run_test(net)
+            rc = run_test(net, ctrl)
         else:
             configure_ipv6(net)
             CLI(net)
-
     sys.exit(rc)
 
 
