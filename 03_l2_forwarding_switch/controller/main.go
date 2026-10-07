@@ -1,7 +1,7 @@
 // Case 03: static L2 forwarding controller.
 //
-// Pushes the pipeline, then writes four dmac table entries mapping
-// 00:00:00:00:00:0{1..4} to switch ports 1..4. Runs until SIGTERM.
+// Pushes the pipeline, then maps each host's MAC to its switch port.
+// The default topology has four hosts. Runs until a signal.
 package main
 
 import (
@@ -20,9 +20,16 @@ import (
 	"github.com/zhh2001/p4runtime-go-controller/tableentry"
 )
 
-// macOfHost returns the well-known MAC of host hN in the 4-host topology.
+// macOfHost returns the MAC of host hN in the /24 topology.
 func macOfHost(n int) string {
-	return fmt.Sprintf("00:00:00:00:00:%02d", n)
+	return fmt.Sprintf("00:00:00:00:00:%02x", n)
+}
+
+func validateHostCount(n int) error {
+	if n < 1 || n > 254 {
+		return fmt.Errorf("-hosts must be between 1 and 254 for the /24 topology")
+	}
+	return nil
 }
 
 func main() {
@@ -34,6 +41,9 @@ func main() {
 		hosts  = flag.Int("hosts", 4, "number of hosts in the topology")
 	)
 	flag.Parse()
+	if err := validateHostCount(*hosts); err != nil {
+		log.Fatal(err)
+	}
 	if *p4info == "" || *config == "" {
 		log.Fatal("-p4info and -config are required")
 	}

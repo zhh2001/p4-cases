@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Case 03: static L2 forwarding.
 #
-#   sudo ./run.sh        # pingAll across 4 hosts, expect 0% drop
+#   sudo ./run.sh        # validate complete L2 frames and ping all 4 hosts
 #   sudo ./run.sh cli    # drop into mininet CLI after bring-up
 
 set -euo pipefail
@@ -27,7 +27,7 @@ if [[ "${MODE}" == "test" ]]; then
     EXTRA+=(--run-test)
 fi
 
-log "Starting mininet + controller + (optional) pingAll"
+log "Starting mininet + controller + (optional) L2 forwarding test"
 start_topology "${CASE_DIR}/topology.py" \
     --p4info "${BUILD_DIR}/main.p4info.txt" \
     --config "${BUILD_DIR}/main.json" \

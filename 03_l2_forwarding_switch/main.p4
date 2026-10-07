@@ -50,14 +50,22 @@ control MyIngress(inout headers hdr,
         }
         actions = {
             forward;
-            NoAction;
+            drop;
         }
         size = 256;
-        default_action = NoAction;
+        default_action = drop;
     }
 
     apply {
+        if (standard_metadata.parser_error != error.NoError ||
+            !hdr.ethernet.isValid()) {
+            drop();
+            return;
+        }
         dmac.apply();
+        if (standard_metadata.egress_spec == standard_metadata.ingress_port) {
+            drop();
+        }
     }
 }
 
