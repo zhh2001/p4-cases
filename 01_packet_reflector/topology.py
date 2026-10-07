@@ -1,40 +1,64 @@
 #!/usr/bin/env python3
-"""Mininet topology for Case 01: packet reflector.
-
-Single-switch, single-host network. The switch reflects every incoming
-packet back to its ingress port after swapping src/dst MAC addresses.
-No table entries are needed because the P4 program hard-codes the
-reflect logic; the controller only pushes the pipeline.
-"""
+"""Validate MAC-swapped reflections, ingress ports and complete frames."""
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import importlib
+import json
 import os
+from pathlib import Path
+import subprocess
 import sys
+import tempfile
+import time
+import uuid
 
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
+from mininet.net import Mininet
 from mininet.topo import Topo
 
-# Allow `from common.p4switch import ...` when this file is run from its
-# own directory.
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from common.p4switch import P4RuntimeSwitch  # noqa: E402
+from common.p4switch import P4RuntimeSwitch, reset_port_allocators  # noqa: E402
 from common.runtime import Controller, NetworkRuntime  # noqa: E402
+
+packets = importlib.import_module("01_packet_reflector.packets")
 
 
 class ReflectorTopo(Topo):
-    def build(self, **_opts) -> None:
+    def build(self, n_hosts: int = 1, **_opts) -> None:
+        packets.validate_host_count(n_hosts)
         sw = self.addSwitch("s1", cls=P4RuntimeSwitch, device_id=1)
-        h1 = self.addHost("h1", ip="10.0.0.1/24", mac="00:00:00:00:00:01")
-        self.addLink(h1, sw)
+        for number in range(1, n_hosts + 1):
+            host = self.addHost(
+                f"h{number}",
+                ip=packets.host_ip(number) + "/24",
+                mac=packets.host_mac(number),
+            )
+            self.addLink(host, sw)
+
+
+def configure_test_interfaces(net: Mininet, n_hosts: int) -> None:
+    for name in (*[f"h{number}" for number in range(1, n_hosts + 1)], "s1"):
+        node = net.get(name)
+        settings = [
+            f"net.ipv6.conf.{intf.name}.disable_ipv6=1"
+            for intf in node.intfList()
+            if intf.name != "lo"
+        ]
+        output, error, code = node.pexec(["sysctl", "-q", "-w", *settings])
+        if code:
+            raise RuntimeError(
+                f"interface command failed: {output.strip()} {error.strip()}"
+            )
 
 
 def run_controller(
     runtime: NetworkRuntime, controller_bin: str, p4info: str, config: str
-):
+) -> Controller:
     info("*** Launching Go controller to push pipeline\n")
     return runtime.start_controller(
         [
@@ -50,7 +74,178 @@ def run_controller(
 
 
 def wait_controller_ready(proc: Controller, timeout: float = 10.0) -> bool:
-    return proc.wait_ready("pipeline installed", timeout)
+    return proc.wait_ready("reflector ready", timeout)
+
+
+def read_probe(proc: subprocess.Popen, timeout: float = 4) -> dict:
+    output, error = proc.communicate(timeout=timeout)
+    if proc.returncode:
+        raise RuntimeError(f"packet probe failed: {output.strip()} {error.strip()}")
+    try:
+        reply = json.loads(output)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("packet probe returned invalid JSON") from exc
+    if not isinstance(reply, dict):
+        raise RuntimeError("packet probe reply must be an object")
+    return reply
+
+
+def frame_list(reply: dict) -> list[bytes]:
+    frames = reply.get("frames")
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, str) for frame in frames
+    ):
+        raise RuntimeError("capture reply must contain frame hex strings")
+    try:
+        return [bytes.fromhex(frame) for frame in frames]
+    except ValueError as exc:
+        raise RuntimeError("capture reply contains invalid frame bytes") from exc
+
+
+def check_delivery(
+    probes: list[dict], received: dict[str, list[bytes]], n_hosts: int = 1
+) -> None:
+    if set(received) != {f"h{number}" for number in range(1, n_hosts + 1)}:
+        raise RuntimeError("capture replies must include every host")
+    for name, frames in received.items():
+        expected = [
+            packets.reflect_frame(item["frame"])
+            for item in probes
+            if item["receiver"] == name
+        ]
+        if (
+            not isinstance(frames, list)
+            or any(not isinstance(frame, bytes) for frame in frames)
+            or Counter(frames) != Counter(expected)
+        ):
+            raise RuntimeError(
+                f"{name} did not receive exactly the expected complete frames"
+            )
+
+
+def stop_probe(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def run_probes(
+    net: Mininet, ctrl: Controller, prefix: bytes, probes: list[dict], n_hosts: int = 1
+) -> None:
+    if ctrl.proc.poll() is not None:
+        raise RuntimeError("controller exited before the reflector test")
+    packets.validate_host_count(n_hosts)
+    duration = 2 + 0.2 * max(0, n_hosts - 4)
+    names = [f"h{number}" for number in range(1, n_hosts + 1)]
+    procs = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="p4-reflector-") as directory:
+            receivers = {}
+            for name in names:
+                host = net.get(name)
+                ready = Path(directory) / f"{name}-ready"
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/test.py",
+                        "receive",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--prefix",
+                        prefix.hex(),
+                        "--seconds",
+                        str(duration),
+                        "--ready",
+                        str(ready),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                receivers[name] = (proc, ready)
+            deadline = time.monotonic() + 2 + 0.05 * max(0, n_hosts - 4)
+            while not all(
+                ready.exists() and ready.read_text() == "ready\n"
+                for _, ready in receivers.values()
+            ):
+                if time.monotonic() >= deadline or any(
+                    proc.poll() is not None for proc, _ in receivers.values()
+                ):
+                    raise RuntimeError("packet receivers did not become ready")
+                time.sleep(0.02)
+            senders = []
+            for name in names:
+                frames = [item["frame"] for item in probes if item["sender"] == name]
+                if not frames:
+                    continue
+                manifest = Path(directory) / f"{name}.json"
+                manifest.write_text(json.dumps([frame.hex() for frame in frames]))
+                host = net.get(name)
+                proc = host.popen(
+                    [
+                        "python3",
+                        f"{HERE}/test.py",
+                        "send",
+                        "--iface",
+                        host.defaultIntf().name,
+                        "--frames",
+                        str(manifest),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                procs.append(proc)
+                senders.append((proc, len(frames)))
+            for proc, count in senders:
+                reply = read_probe(proc)
+                if type(reply.get("sent")) is not int or reply["sent"] != count:
+                    raise RuntimeError("sender did not confirm all test frames")
+            captured = {
+                name: frame_list(read_probe(proc, timeout=duration + 5))
+                for name, (proc, _) in receivers.items()
+            }
+        check_delivery(probes, captured, n_hosts)
+        if ctrl.proc.poll() is not None:
+            raise RuntimeError("controller exited during the reflector test")
+    finally:
+        for proc in procs:
+            stop_probe(proc)
+
+
+def run_test(net: Mininet, ctrl: Controller, n_hosts: int = 1) -> int:
+    try:
+        packets.validate_host_count(n_hosts)
+        if ctrl.proc.poll() is not None:
+            raise RuntimeError("controller exited before the reflector test")
+        configure_test_interfaces(net, n_hosts)
+        prefix = b"\x02" + uuid.uuid4().bytes[:3]
+        probes = packets.make_probes(prefix, n_hosts)
+        run_probes(net, ctrl, prefix, probes, n_hosts)
+        if ctrl.proc.poll() is not None:
+            raise RuntimeError("controller exited during the reflector test")
+    except (
+        RuntimeError,
+        OSError,
+        ValueError,
+        TypeError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        print(f"FAILURE: {exc}")
+        return 1
+    print(
+        f"Reflector probes: sent={len(probes)} reflected={len(probes)} hosts={n_hosts}"
+    )
+    print("SUCCESS: MAC swapping, ingress reflection and complete frames validated")
+    return 0
 
 
 def main() -> None:
@@ -58,15 +253,17 @@ def main() -> None:
     parser.add_argument("--p4info", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--controller", required=True)
-    parser.add_argument(
-        "--run-test",
-        action="store_true",
-        help="run test.py in h1 and exit with its result",
-    )
+    parser.add_argument("--n-hosts", type=int, default=1)
+    parser.add_argument("--run-test", action="store_true")
     args = parser.parse_args()
+    try:
+        packets.validate_host_count(args.n_hosts)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     setLogLevel("info")
-    with NetworkRuntime(ReflectorTopo()) as runtime:
+    reset_port_allocators()
+    with NetworkRuntime(ReflectorTopo(n_hosts=args.n_hosts)) as runtime:
         net = runtime.net
 
         ctrl = run_controller(runtime, args.controller, args.p4info, args.config)
@@ -76,11 +273,7 @@ def main() -> None:
 
         rc = 0
         if args.run_test:
-            h1 = net.get("h1")
-            info("*** Running test in h1\n")
-            out = h1.cmd(f"python3 {HERE}/test.py")
-            sys.stdout.write(out)
-            rc = 0 if "SUCCESS" in out else 1
+            rc = run_test(net, ctrl, args.n_hosts)
         else:
             CLI(net)
 

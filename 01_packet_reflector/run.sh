@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile the P4 program, boot the mininet topology, let the Go
-# controller push the pipeline, run the reflector verification, and
+# controller push the pipeline, verify complete reflected frames, and
 # tear everything down.
 #
 #   sudo ./run.sh         # run automated test and exit

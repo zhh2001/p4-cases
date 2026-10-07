@@ -20,7 +20,7 @@ parser MyParser(packet_in packet,
                 inout metadata meta,
                 inout standard_metadata_t standard_metadata) {
 
-    state start{
+    state start {
         packet.extract(hdr.ethernet);
         transition accept;
     }
@@ -44,6 +44,11 @@ control MyIngress(inout headers hdr,
     }
 
     apply {
+        if (standard_metadata.parser_error != error.NoError ||
+            !hdr.ethernet.isValid()) {
+            mark_to_drop(standard_metadata);
+            return;
+        }
         swap_mac();
         set_egress_spec();
     }
