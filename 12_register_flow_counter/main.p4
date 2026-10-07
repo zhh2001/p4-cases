@@ -2,21 +2,26 @@
 /*
  * Case 12: Per-flow packet counter stored in a P4 register.
  *
- * Every IPv4/UDP packet:
+ * Every valid, unfragmented IPv4/UDP packet:
  *   1. Hash (srcIP, dstIP, srcPort, dstPort) into a 10-bit slot.
  *   2. Read register[slot], add 1, write back.
- *   3. Cross-forward 1<->2 so scapy can observe flows on the peer.
+ *   3. Cross-forward 1<->2 without changing the complete frame.
  *
- * The controller reads back the register to demonstrate how user-
- * controlled state in P4 is accessible via P4Runtime RegisterEntry
- * (counter extern would be the conventional choice for this; the
- * point of this case is to show the register-as-user-state pattern).
+ * Fragments and other protocols are forwarded without incrementing.
+ * The controller tries a P4Runtime RegisterEntry write. The topology
+ * reads the complete register array through BMv2's Thrift interface.
  */
 
 #include <core.p4>
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV4 = 0x0800;
+
+error {
+    InvalidIPv4Version,
+    InvalidIPv4Length,
+    InvalidUDPLength
+}
 
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
@@ -50,11 +55,16 @@ header udp_t {
     bit<16> checksum;
 }
 
+header ipv4_options_t {
+    varbit<320> data;
+}
+
 struct metadata {}
 
 struct headers {
     ethernet_t ethernet;
     ipv4_t     ipv4;
+    ipv4_options_t options;
     udp_t      udp;
 }
 
@@ -71,18 +81,55 @@ parser MyParser(packet_in packet,
     }
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
-        transition select(hdr.ipv4.protocol) {
-            17:      parse_udp;
+        verify(hdr.ipv4.version == 4, error.InvalidIPv4Version);
+        verify(hdr.ipv4.ihl >= 5, error.InvalidIPv4Length);
+        verify(hdr.ipv4.totalLen >= (bit<16>)hdr.ipv4.ihl * 4,
+               error.InvalidIPv4Length);
+        verify((bit<32>)hdr.ipv4.totalLen <= standard_metadata.packet_length - 14,
+               error.InvalidIPv4Length);
+        transition select(hdr.ipv4.ihl) {
+            5:       parse_protocol;
+            default: parse_options;
+        }
+    }
+    state parse_options {
+        packet.extract(hdr.options, ((bit<32>)hdr.ipv4.ihl - 5) * 32);
+        transition parse_protocol;
+    }
+    state parse_protocol {
+        // A fragment's payload may contain incomplete or absent UDP ports.
+        transition select(hdr.ipv4.protocol, hdr.ipv4.flags[0:0], hdr.ipv4.fragOffset) {
+            (17, 0, 0): parse_udp;
             default: accept;
         }
     }
     state parse_udp {
+        verify(hdr.ipv4.totalLen >= (bit<16>)hdr.ipv4.ihl * 4 + 8,
+               error.InvalidUDPLength);
         packet.extract(hdr.udp);
+        verify(hdr.udp.length_ >= 8 &&
+               hdr.udp.length_ <= hdr.ipv4.totalLen - (bit<16>)hdr.ipv4.ihl * 4,
+               error.InvalidUDPLength);
         transition accept;
     }
 }
 
-control MyVerifyChecksum(inout headers hdr, inout metadata meta) { apply {} }
+#define IPV4_FIELDS \
+    hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.diffserv, \
+    hdr.ipv4.totalLen, hdr.ipv4.identification, hdr.ipv4.flags, \
+    hdr.ipv4.fragOffset, hdr.ipv4.ttl, hdr.ipv4.protocol, \
+    hdr.ipv4.srcAddr, hdr.ipv4.dstAddr
+
+control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
+    apply {
+        verify_checksum(hdr.ipv4.isValid() && !hdr.options.isValid(),
+                        { IPV4_FIELDS }, hdr.ipv4.hdrChecksum,
+                        HashAlgorithm.csum16);
+        verify_checksum(hdr.ipv4.isValid() && hdr.options.isValid(),
+                        { IPV4_FIELDS, hdr.options.data }, hdr.ipv4.hdrChecksum,
+                        HashAlgorithm.csum16);
+    }
+}
 
 control MyIngress(inout headers hdr,
                   inout metadata meta,
@@ -92,6 +139,11 @@ control MyIngress(inout headers hdr,
     register<bit<32>>(1024) flow_counter;
 
     apply {
+        if (standard_metadata.parser_error != error.NoError ||
+            standard_metadata.checksum_error == 1) {
+            mark_to_drop(standard_metadata);
+            return;
+        }
         // Cross-forward like Case 02.
         if (standard_metadata.ingress_port == 1) {
             standard_metadata.egress_spec = 2;
@@ -111,10 +163,12 @@ control MyIngress(inout headers hdr,
                    hdr.udp.srcPort,  hdr.udp.dstPort },
                  (bit<16>)1024);
 
-            bit<32> current;
-            flow_counter.read(current, (bit<32>)slot);
-            current = current + 1;
-            flow_counter.write((bit<32>)slot, current);
+            @atomic {
+                bit<32> current;
+                flow_counter.read(current, (bit<32>)slot);
+                current = current + 1;
+                flow_counter.write((bit<32>)slot, current);
+            }
         }
     }
 }
@@ -129,6 +183,7 @@ control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
+        packet.emit(hdr.options);
         packet.emit(hdr.udp);
     }
 }

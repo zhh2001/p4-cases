@@ -1,14 +1,12 @@
-// Case 12: register-based flow counter — controller side.
+// Case 12: register-based flow counter controller.
 //
 // Installs the pipeline, demonstrates a register WRITE via the SDK's
-// register package (pre-seeding slot 0 with a sentinel value so you
-// can verify round-tripping), and exposes a `quit` command on stdin.
+// register package (pre-seeding slot 1023 with a sentinel value), and
+// exposes a `quit` command on stdin.
 //
-// NOTE: BMv2's P4Runtime server currently returns Unimplemented for
-// register READS (RegisterEntry with index set and empty data). The
-// companion run.sh uses `simple_switch_CLI` over Thrift to read back
-// register values for verification — the P4 data-plane code itself is
-// the same story regardless of how the control plane peeks at state.
+// Targets may leave RegisterEntry unimplemented. Only an explicit
+// UNIMPLEMENTED response permits skipping the seed. The topology uses
+// simple_switch_CLI over Thrift to validate complete register snapshots.
 package main
 
 import (
@@ -16,6 +14,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -23,11 +22,83 @@ import (
 	"syscall"
 	"time"
 
+	p4v1 "github.com/p4lang/p4runtime/go/p4/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/zhh2001/p4runtime-go-controller/client"
 	"github.com/zhh2001/p4runtime-go-controller/codec"
 	"github.com/zhh2001/p4runtime-go-controller/pipeline"
 	"github.com/zhh2001/p4runtime-go-controller/register"
 )
+
+func unsupportedRegisterWrite(err error) bool {
+	response, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	if response.Code() == codes.Unimplemented {
+		return true
+	}
+	// P4Runtime reports per-update errors inside an UNKNOWN RPC status.
+	if response.Code() != codes.Unknown {
+		return false
+	}
+	details := response.Details()
+	if len(details) != 1 {
+		return false
+	}
+	item, ok := details[0].(*p4v1.Error)
+	return ok && item.CanonicalCode == int32(codes.Unimplemented)
+}
+
+func serveCommands(ctx context.Context, input io.ReadCloser, output io.Writer) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer input.Close()
+	type command struct {
+		line string
+		err  error
+	}
+	commands := make(chan command)
+	go func() {
+		defer close(commands)
+		scanner := bufio.NewScanner(input)
+		for scanner.Scan() {
+			select {
+			case commands <- command{line: scanner.Text()}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			select {
+			case commands <- command{err: err}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case item, ok := <-commands:
+			if !ok {
+				return nil
+			}
+			if item.err != nil {
+				return item.err
+			}
+			line := strings.TrimSpace(item.line)
+			if line == "" || line == "quit" {
+				return nil
+			}
+			if _, err := fmt.Fprintf(output, "unknown command %q\n", line); err != nil {
+				return err
+			}
+		}
+	}
+}
 
 func main() {
 	var (
@@ -80,36 +151,26 @@ func main() {
 
 	// Demonstrate register.Write: initialise a distinguishing slot so
 	// the thrift-side verifier can confirm control-plane writes
-	// reached the data plane. BMv2 will later overwrite this slot if
-	// a packet happens to hash there; we just want one round-trip.
+	// reached the data plane. Packet counts accumulate from this value.
 	r, err := register.NewReader(c, p)
 	if err != nil {
 		log.Fatalf("register reader: %v", err)
 	}
-	if err := r.Write(ctx, "MyIngress.flow_counter", 1023, codec.MustEncodeUint(42, 32)); err != nil {
-		log.Printf("warn: register write not accepted by BMv2 (%v) — continuing", err)
+	writeCtx, writeCancel := context.WithTimeout(ctx, 3*time.Second)
+	err = r.Write(writeCtx, "MyIngress.flow_counter", 1023, codec.MustEncodeUint(42, 32))
+	writeCancel()
+	if err != nil {
+		if !unsupportedRegisterWrite(err) {
+			log.Fatalf("seed register: %v", err)
+		}
+		log.Println("register seed skipped: RegisterEntry write is unimplemented")
 	} else {
 		log.Printf("seeded flow_counter[1023] = 42")
 	}
 
 	fmt.Println("register-counter ready")
 
-	scanner := bufio.NewScanner(os.Stdin)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		if !scanner.Scan() {
-			return
-		}
-		line := strings.TrimSpace(scanner.Text())
-		switch line {
-		case "", "quit":
-			return
-		default:
-			fmt.Printf("unknown command %q\n", line)
-		}
+	if err := serveCommands(ctx, os.Stdin, os.Stdout); err != nil {
+		log.Fatalf("controller commands: %v", err)
 	}
 }

@@ -20,22 +20,22 @@
 
 按编号由浅入深，每个后一个在前一个的基础上加一点：
 
-| 编号                            | 案例              | 核心概念                               | 控制器做什么                                     |
-| ------------------------------- | ----------------- | -------------------------------------- | ------------------------------------------------ |
-| [01](01_packet_reflector/)      | Packet Reflector  | Parse → Match-Action → Deparse         | **只推 pipeline**                                |
-| [02](02_repeater/)              | Port Repeater     | 硬编码 `if-else` vs 查找表             | 只推 pipeline                                    |
-| [03](03_l2_forwarding_switch/)  | L2 静态转发       | EXACT 表 + action 参数                 | 写 4 条 `dmac` 表项                              |
-| [04](04_l2_broadcast_switch/)   | L2 广播交换机     | **PRE / MulticastGroup**               | 上面 + 4 个 mcast 组 + `select_mcast_grp` 表项   |
-| [05](05_l2_learning_switch/)    | L2 学习交换机     | **Digest** (数据面→控制面通知)         | 启用并订阅 digest，动态写入 `smac`/`dmac`        |
-| [06](06_int/)                   | 带内网络遥测      | **多交换机 + IPv4 Options + 逐跳遥测** | 并行 3 个控制器，各装 LPM + `int_table` 默认动作 |
-| [07](07_meter/)                 | Meter             | **Meter extern / 三色标记**            | `MeterEntry` 配 CIR/PIR，drop 非绿流量           |
-| [08](08_counter/)               | Counter           | **Counter extern / 读取累积值**        | 按索引或表项读取包数和字节数                     |
-| [09](09_ecmp_hash/)             | ECMP 多路径       | **5-tuple hash + ecmp group**          | direct /32 + /24 ECMP + `ecmp_nhop` 2 个成员     |
-| [10](10_firewall_acl/)          | 防火墙 ACL        | **TERNARY 表 + priority**              | 3 条不同优先级的 allow/deny 规则                 |
-| [11](11_vxlan_encap/)           | VXLAN 封装        | **头部插入 / `setValid()`**            | 一条 vtep 表，配置出口、外层地址与 VNI           |
-| [12](12_register_flow_counter/) | Register 逐流统计 | **register + hash(5-tuple)**           | 纯数据面维护，控制器通过 Thrift 读回             |
-| [13](13_clone_to_cpu/)          | 克隆到 CPU        | **CloneSession + PacketIn**            | 每包 clone 到 CPU port，控制器 `OnPacketIn` 收包 |
-| [14](14_ipv6_lpm/)              | IPv6 LPM 路由     | **128 位 LPM + L3 重写 + hopLimit**    | 4 条路由(/64×3 + /128×1)，演示长前缀优先         |
+| 编号                            | 案例                | 核心概念                               | 控制器做什么                                     |
+| ------------------------------- | ------------------- | -------------------------------------- | ------------------------------------------------ |
+| [01](01_packet_reflector/)      | Packet Reflector    | Parse → Match-Action → Deparse         | **只推 pipeline**                                |
+| [02](02_repeater/)              | Port Repeater       | 硬编码 `if-else` vs 查找表             | 只推 pipeline                                    |
+| [03](03_l2_forwarding_switch/)  | L2 静态转发         | EXACT 表 + action 参数                 | 写 4 条 `dmac` 表项                              |
+| [04](04_l2_broadcast_switch/)   | L2 广播交换机       | **PRE / MulticastGroup**               | 上面 + 4 个 mcast 组 + `select_mcast_grp` 表项   |
+| [05](05_l2_learning_switch/)    | L2 学习交换机       | **Digest** (数据面→控制面通知)         | 启用并订阅 digest，动态写入 `smac`/`dmac`        |
+| [06](06_int/)                   | 带内网络遥测        | **多交换机 + IPv4 Options + 逐跳遥测** | 并行 3 个控制器，各装 LPM + `int_table` 默认动作 |
+| [07](07_meter/)                 | Meter               | **Meter extern / 三色标记**            | `MeterEntry` 配 CIR/PIR，drop 非绿流量           |
+| [08](08_counter/)               | Counter             | **Counter extern / 读取累积值**        | 按索引或表项读取包数和字节数                     |
+| [09](09_ecmp_hash/)             | ECMP 多路径         | **5-tuple hash + ecmp group**          | direct /32 + /24 ECMP + `ecmp_nhop` 2 个成员     |
+| [10](10_firewall_acl/)          | 防火墙 ACL          | **TERNARY 表 + priority**              | 3 条不同优先级的 allow/deny 规则                 |
+| [11](11_vxlan_encap/)           | VXLAN 封装          | **头部插入 / `setValid()`**            | 一条 vtep 表，配置出口、外层地址与 VNI           |
+| [12](12_register_flow_counter/) | Register 哈希桶统计 | **register + UDP 四元组哈希**          | 安装 pipeline，并尝试写入 register 初值          |
+| [13](13_clone_to_cpu/)          | 克隆到 CPU          | **CloneSession + PacketIn**            | 每包 clone 到 CPU port，控制器 `OnPacketIn` 收包 |
+| [14](14_ipv6_lpm/)              | IPv6 LPM 路由       | **128 位 LPM + L3 重写 + hopLimit**    | 4 条路由(/64×3 + /128×1)，演示长前缀优先         |
 
 ---
 
@@ -120,7 +120,7 @@ p4-cases/
 | 09      | 按 CRC16 核对 TCP 和 UDP 的逐包路径、同流一致性、直达路由与分片转发，并检查完整报文及异常输入的丢弃                 |
 | 10      | 按 IHL 读取端口，核对双向正常和 Options 流量，丢弃 IPv4 分片及所检查的格式异常报文                                  |
 | 11      | 按入包长度生成 VXLAN 外层头，逐字节核对完整封装帧，并检查未匹配流量的丢弃                                           |
-| 12      | Thrift 读出 register 某 slot = 注入包数                                                                             |
+| 12      | 核对全部 1024 个槽位的精确增量，验证双向完整转发、哈希碰撞、分片不计数和 32 位回绕                                  |
 | 13      | 双向各发送 10 帧，逐包核对主机收到的原包和控制器收到的副本，并检查 CPU 头中的入端口                                 |
 | 14      | 4 条 IPv6 流：`/64` 命中、`/128` 长前缀覆盖、回退到 `/64`、无路由的流被 drop。同时校验 `hopLimit-1` 和 dst-MAC 重写 |
 
