@@ -5,8 +5,8 @@ body:
   - type: markdown
     attributes:
       value: >
-        Before submitting, please skim the roadmap in the top-level README
-        to avoid duplicating a planned case.
+        Before submitting, please check the learning path and future case
+        suggestions in the top-level README to avoid duplicating a case.
   - type: input
     id: name
     attributes:
@@ -31,4 +31,4 @@ body:
     id: verify
     attributes:
       label: How would the automated test verify it?
-      description: scapy probe, counter read, pingAll, ...
+      description: Raw Ethernet probes, counter reads, connectivity checks.

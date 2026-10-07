@@ -78,11 +78,15 @@ sudo ./run.sh
 sudo ./run.sh cli
 ```
 
-CLI 中可以运行 `pingall`，两个主机应互通。手动读取寄存器：
+Mininet CLI 中可以运行 `pingall`，两个主机应互通。在另一终端启动 Thrift CLI：
 
 ```bash
 simple_switch_CLI --thrift-port 9090
-# 在 CLI 中输入
+```
+
+在 Thrift CLI 中输入：
+
+```text
 register_read MyIngress.flow_counter
 ```
 

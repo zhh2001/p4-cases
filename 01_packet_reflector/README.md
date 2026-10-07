@@ -1,4 +1,4 @@
-# Case 01 · Packet Reflector
+# Case 01：报文反射器
 
 这个案例展示最小的 P4 处理流程：解析以太头，交换源 MAC 和目的 MAC，再从入端口原路送回。控制器只安装流水线，无需写入表项。
 
@@ -47,7 +47,7 @@ SUCCESS: MAC swapping, ingress reflection and complete frames validated
 `topology.py` 支持 `--n-hosts`，范围为 1 到 254。编译后可用多主机拓扑检查不同入端口的回包，确保其他主机没有收到副本：
 
 ```bash
-sudo python3 topology.py --n-hosts 3 --run-test \
+sudo /usr/bin/python3 topology.py --n-hosts 3 --run-test \
     --p4info build/main.p4info.txt --config build/main.json \
     --controller bin/controller
 ```

@@ -4,6 +4,8 @@
 
 `compile_p4` 按源码文件名生成 JSON 和 P4Info。例如 `indirect_meter.p4` 生成 `build/indirect_meter.json` 和 `build/indirect_meter.p4info.txt`。拓扑读取这两个文件，每次运行都会重新编译。
 
+控制器共用根目录的 `go.mod` 和 `go.sum`。运行脚本从根目录构建对应的 Go 包，依赖版本以这两个文件为准。
+
 ## 拓扑和控制器
 
 使用 `NetworkRuntime` 管理 Mininet 和控制器：
@@ -35,13 +37,20 @@ sudo env P4_SWITCH_PATH=/your/path/simple_switch_grpc ./run.sh
 
 `P4RuntimeSwitch(..., sw_path="/your/path/simple_switch_grpc")` 的显式参数优先于环境变量。启动前检查 gRPC 和 Thrift 端口占用，已有监听服务时会报错。
 
+默认 gRPC 端口从 9559 开始，Thrift 端口从 9090 开始，同一拓扑内逐台递增。日志位于 `/tmp/s1.log` 和 `/tmp/s1.log.stderr`，其他交换机按名称生成对应文件。不同案例应顺序运行。
+
 ## 回归测试
 
-安装 Mininet 后，从仓库根目录执行，无需 root：
+安装 Mininet 后，从仓库根目录使用系统 Python 执行，无需 root：
 
 ```bash
-python3 -m unittest discover -s tests -v
+/usr/bin/python3 -m compileall -q common tests ./*/*.py
+/usr/bin/python3 -m unittest discover -s tests -v
+go vet ./...
+go test -race ./...
 shellcheck -x common/run_helpers.sh */run.sh
 ```
 
-测试覆盖日志超时、提前退出、输出过量、stdin 命令、启动异常、信号退出和进程回收。真实数据面测试仍通过各案例的 `sudo ./run.sh` 执行。
+运行测试覆盖日志超时、提前退出、输出过量、stdin 命令、启动异常、信号退出和进程回收。案例回归测试还覆盖报文构造、完整内容、计数及结果校验。
+
+真实数据面测试通过各案例的 `sudo ./run.sh` 执行，Case 08 还需运行 `sudo ./run.sh test direct`。CI 编译全部 17 份 P4 源码并运行单元测试，15 种完整运行方式的范围见[总 README](../README.md)。

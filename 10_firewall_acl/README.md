@@ -113,7 +113,7 @@ pingall
 无需启动交换机的回归测试在仓库根目录运行：
 
 ```bash
-python3 -m unittest discover -s tests -p test_firewall_acl.py -v
+/usr/bin/python3 -m unittest discover -s tests -p test_firewall_acl.py -v
 ```
 
 ## 范围

@@ -1,16 +1,15 @@
 name: ci
 
-# p4-cases CI: compile every case's P4 source and build every case's
-# Go controller. Live mininet / BMv2 tests require root + kernel
-# namespaces + Docker-style privileges that github-hosted runners do
-# not grant by default, so they are NOT run here — they are covered
-# by `sudo ./run.sh` locally on any Ubuntu 24.04+ machine.
+# Compile all P4 sources and Go controllers, including P4 examples
+# without a complete runtime entry point. Run unit tests and shell lint.
+# Live Mininet / BMv2 tests use root and network namespaces. This workflow
+# does not run them. Validate each supported mode locally with run.sh.
 #
 # What CI catches:
 #   * P4 source compile errors.
 #   * Go controller source compile errors, tests and tidy drift.
 #   * run.sh / run_helpers.sh lint regressions.
-#   * Python syntax, runtime lifecycle and learning validation tests.
+#   * Python syntax, runtime lifecycle and packet validation tests.
 
 on:
   push:
@@ -31,9 +30,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Install p4c from the p4lang OBS repo. More reliable than the
-      # p4lang/p4c Docker image which has been shipping missing boost
-      # libraries, and faster than building from source.
+      # Install p4c as a binary package from p4lang OBS.
+      # Print its version for comparison with local compiler output.
       - name: install p4c (p4lang OBS)
         shell: bash
         run: |

@@ -108,7 +108,7 @@ sudo ./run.sh cli
 
 ```bash
 go test ./13_clone_to_cpu/controller
-python3 -m unittest discover -s tests -p test_clone_to_cpu.py -v
+/usr/bin/python3 -m unittest discover -s tests -p test_clone_to_cpu.py -v
 ```
 
 ## 与 Case 05 的区别

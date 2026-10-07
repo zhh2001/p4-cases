@@ -57,7 +57,7 @@ sudo ./run.sh cli
 先通过 `run.sh` 生成编译产物，也可以指定主机数量：
 
 ```bash
-sudo python3 topology.py --n-hosts 12 --run-test \
+sudo /usr/bin/python3 topology.py --n-hosts 12 --run-test \
     --p4info build/main.p4info.txt --config build/main.json \
     --controller bin/controller
 ```

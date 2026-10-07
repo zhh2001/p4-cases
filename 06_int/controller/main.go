@@ -3,11 +3,11 @@
 // A single Go binary configures any of the three switches in the INT
 // topology (s1, s2, s3), parameterised by -switch-id. Each switch gets:
 //
-//   * ipv4_lpm entries encoding the local view of the IPv4 routing
+//   - ipv4_lpm entries encoding the local view of the IPv4 routing
 //     table (which dst subnet to send where, with which rewritten dst
 //     MAC).
-//   * ipv4_lpm default action set to drop (unknown destinations).
-//   * int_table default action set to add_int_header(switch_id) so the
+//   - ipv4_lpm default action set to drop (unknown destinations).
+//   - int_table default action set to add_int_header(switch_id) so the
 //     egress pipeline appends an INT trace stanza with this switch's
 //     ID on every packet that already carries an INT option.
 package main

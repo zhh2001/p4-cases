@@ -1,4 +1,4 @@
-# Case 02 · Port Repeater
+# Case 02：端口中继器
 
 这个案例用硬编码的端口映射实现双向转发，控制器只安装流水线，无需写入表项。
 
@@ -55,6 +55,6 @@ go test ./...
 
 ## 排查问题
 
-先查看控制器输出和 `s1.log`，确认流水线安装成功。`test.py` 的 `send` 和 `receive` 子命令使用显式参数，可通过 `python3 test.py send --help` 和 `python3 test.py receive --help` 查看用法。
+先查看控制器输出、`/tmp/s1.log` 和 `/tmp/s1.log.stderr`，确认流水线安装成功。`test.py` 的 `send` 和 `receive` 子命令使用显式参数，可通过 `python3 test.py send --help` 和 `python3 test.py receive --help` 查看用法。
 
 自动测试结束、启动失败或收到退出信号时会清理本次网络。若进程被强制终止，先确认没有其他拓扑运行，再手动清理残留。

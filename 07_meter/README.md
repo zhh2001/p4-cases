@@ -122,7 +122,7 @@ sudo ./run.sh cli
 在仓库根目录执行无需交换机的测试：
 
 ```bash
-python3 -m unittest discover -s tests -p test_meter.py -v
+/usr/bin/python3 -m unittest discover -s tests -p test_meter.py -v
 go test ./07_meter/controller
 ```
 

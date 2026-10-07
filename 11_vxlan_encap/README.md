@@ -118,7 +118,7 @@ sudo ./run.sh cli
 在仓库根目录运行无需交换机的测试：
 
 ```bash
-python3 -m unittest discover -s tests -p test_vxlan_encap.py -v
+/usr/bin/python3 -m unittest discover -s tests -p test_vxlan_encap.py -v
 ```
 
 ## 范围

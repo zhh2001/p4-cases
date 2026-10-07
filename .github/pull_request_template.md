@@ -1,41 +1,32 @@
-<!--
-提 PR 前先过一下 checklist，这份清单覆盖本仓库所有案例的最低保障，
-不满足的项请在 PR 正文里写清楚理由，方便评审。
--->
+## 变更说明
 
-## 变更摘要
+<!-- 简述预期行为与变更范围。有关联 issue 时在此链接。 -->
 
-<!-- 1-3 句话。这是新案例还是改现有案例？核心要点是什么？ -->
+## 验证结果
 
-## 类型
+<!-- 填写实际执行的命令、环境和结果。未执行的检查应说明原因。 -->
 
-- [ ] 新案例
-- [ ] 现有案例 bug 修复
-- [ ] 文档 / README 改动
-- [ ] common/ 基础设施
-- [ ] CI / workflow
+- [ ] 全部 P4 源码编译通过，包括备用示例。
+- [ ] `/usr/bin/python3 -m unittest discover -s tests -v` 通过。
+- [ ] `go vet ./...` 和 `go test -race ./...` 通过，控制器可构建。
+- [ ] `go mod tidy` 未产生非预期的依赖变化。
+- [ ] `shellcheck -x common/run_helpers.sh */run.sh` 通过。
+- [ ] 相关案例的真实网络测试退出码为零，并出现预期输出。
+- [ ] 文档中的命令、文件路径、转发规则和测试范围与实现一致。
 
-## 新案例 Checklist （只有新案例才需要勾选）
-
-- [ ] `NN_case_name/main.p4` —— P4_16 源码，`p4c -b bmv2 --arch v1model --std p4-16` 能编过
-- [ ] `NN_case_name/topology.py` —— 纯 Mininet 拓扑
-- [ ] `NN_case_name/controller/main.go` —— 基于 `p4runtime-go-controller` 的控制器
-- [ ] `NN_case_name/run.sh` —— 支持 `sudo ./run.sh` (自动验证) 和 `sudo ./run.sh cli` 两种模式
-- [ ] `NN_case_name/README.md` —— 中文说明：P4 结构、控制器做什么、验证方式、排错
-- [ ] 自动化验证：`sudo ./run.sh` 最终输出 `SUCCESS: ...`，失败时非零退出
-- [ ] 顶层 README.md "学习路径" 表格加了新行
-- [ ] `.github/workflows/ci.yml` 的 `CASES` 环境变量里加了新目录名
-
-## 验证
-
-- [ ] `go vet ./...` 通过
-- [ ] `shellcheck -x common/run_helpers.sh NN_case_name/run.sh` 通过
-- [ ] 本地 `sudo ./run.sh` 在 Ubuntu 22.04+ / Mininet 2.3.0+ / BMv2 上跑过，输出粘贴在下方
-
-```
-<!-- 贴 run.sh 最后 20-30 行，到 SUCCESS / FAILURE 为止 -->
+```text
+<!-- 粘贴关键输出。涉及报文处理时说明内容、份数和出端口的检查结果。 -->
 ```
 
-## 其它
+## 新案例
 
-<!-- 关联 issue、外部参考、已知限制等。没有可删 -->
+<!-- 仅新增案例时填写。 -->
+
+- [ ] 采用 `NN_case_name/` 目录，提供 P4 源码、`topology.py` 和 `controller/main.go`。
+- [ ] `run.sh` 支持自动验证和 `cli` 模式，失败时返回非零状态并清理本次资源。
+- [ ] 中文 README 说明拓扑、控制器、转发边界、验证方式和运行限制。
+- [ ] 已更新总 README 的学习路径与 CI 的 `CASES` 列表。
+
+## 限制与参考
+
+<!-- 记录已知限制、外部参考和需要额外验证的运行方式。无内容时可删除。 -->

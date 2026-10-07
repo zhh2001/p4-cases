@@ -6,33 +6,33 @@
 
 Case 04 由控制器预先配置转发表。本案例根据交换机实际收到的报文学习 MAC。目的 MAC 尚未学习时，报文通过多播组发往除入端口以外的主机。
 
-| 表 | 匹配键 | 命中后的动作 | 未命中时的动作 |
-| --- | --- | --- | --- |
-| `smac` | 源 MAC | `NoAction`，停止通知同一源 MAC | `mac_learn`，生成 digest |
-| `dmac` | 目的 MAC | `forward`，从已学习的端口发出 | 进入泛洪路径 |
-| `broadcast` | 入端口 | 选择不含入端口的多播组 | `NoAction` |
+| 表          | 匹配键   | 命中后的动作                   | 未命中时的动作           |
+| ----------- | -------- | ------------------------------ | ------------------------ |
+| `smac`      | 源 MAC   | `NoAction`，停止通知同一源 MAC | `mac_learn`，生成 digest |
+| `dmac`      | 目的 MAC | `forward`，从已学习的端口发出  | 进入泛洪路径             |
+| `broadcast` | 入端口   | 选择不含入端口的多播组         | `NoAction`               |
 
 ## 文件
 
-| 文件 | 作用 |
-| --- | --- |
-| `main_digest.p4` | digest 学习、单播转发和泛洪 |
-| `main_cpu.p4` | CPU clone 学习路径的 P4 示例，默认运行入口不使用它 |
-| `controller/main.go` | 安装流水线和多播组，启用 digest，处理学习事件 |
-| `controller/main_test.go` | 验证 digest 配置、数据解码和表项写入失败后的处理 |
-| `topology.py` | 创建拓扑，读回表项并检查报文转发 |
-| `test.py` | 在主机中发送和捕获带标识的以太网报文 |
-| `run.sh` | 编译、启动和运行自动测试 |
+| 文件                      | 作用                                               |
+| ------------------------- | -------------------------------------------------- |
+| `main_digest.p4`          | digest 学习、单播转发和泛洪                        |
+| `main_cpu.p4`             | CPU clone 学习路径的 P4 示例，默认运行入口不使用它 |
+| `controller/main.go`      | 安装流水线和多播组，启用 digest，处理学习事件      |
+| `controller/main_test.go` | 验证 digest 配置、数据解码和表项写入失败后的处理   |
+| `topology.py`             | 创建拓扑，读回表项并检查报文转发                   |
+| `test.py`                 | 在主机中发送和捕获带标识的以太网报文               |
+| `run.sh`                  | 编译、启动和运行自动测试                           |
 
 ## digest 的启用和处理
 
 注册 `OnDigest` 回调只是订阅控制器收到的消息。交换机还需要一条 `DigestEntry` 才会发送 digest。控制器从 P4Info 查找 `learn_t` 的 ID，并在输出就绪信息之前写入以下配置：
 
-| 配置 | 值 | 含义 |
-| --- | --- | --- |
-| `max_timeout_ns` | `0` | 不等待批量收集 |
-| `max_list_size` | `1` | 每个消息列表只包含一个学习事件 |
-| `ack_timeout_ns` | `1000000000` | 重复事件缓存的超时为一秒 |
+| 配置             | 值           | 含义                           |
+| ---------------- | ------------ | ------------------------------ |
+| `max_timeout_ns` | `0`          | 不等待批量收集                 |
+| `max_list_size`  | `1`          | 每个消息列表只包含一个学习事件 |
+| `ack_timeout_ns` | `1000000000` | 重复事件缓存的超时为一秒       |
 
 回调把消息放入有容量限制的队列，主循环负责写表。每个学习事件按以下顺序处理：
 
@@ -87,7 +87,7 @@ sudo ./run.sh cli
 也可以直接调用拓扑入口调整主机数。参数允许 2 到 254，默认值为 4。`smac` 和 `dmac` 各有 256 个表项，实际学习容量还要考虑其他源 MAC：
 
 ```bash
-sudo python3 topology.py \
+sudo /usr/bin/python3 topology.py \
   --p4info build/main_digest.p4info.txt \
   --config build/main_digest.json \
   --controller bin/controller \
@@ -98,7 +98,7 @@ sudo python3 topology.py \
 
 ```bash
 go test ./05_l2_learning_switch/controller
-python3 -m unittest discover -s tests -p test_learning_switch.py -v
+/usr/bin/python3 -m unittest discover -s tests -p test_learning_switch.py -v
 ```
 
 ## 范围和延伸
