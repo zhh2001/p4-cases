@@ -60,14 +60,23 @@ control MyIngress(inout headers hdr,
         }
         actions = {
             set_mcast_grp;
-            NoAction;
+            drop;
         }
         size = 128;
-        default_action = NoAction;
+        default_action = drop;
     }
 
     apply {
-        if (!dmac.apply().hit){
+        if (standard_metadata.parser_error != error.NoError ||
+            !hdr.ethernet.isValid()) {
+            drop();
+            return;
+        }
+        if (dmac.apply().hit) {
+            if (standard_metadata.egress_spec == standard_metadata.ingress_port) {
+                drop();
+            }
+        } else {
             select_mcast_grp.apply();
         }
     }

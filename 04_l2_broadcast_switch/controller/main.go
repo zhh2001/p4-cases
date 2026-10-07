@@ -25,7 +25,31 @@ import (
 )
 
 func macOfHost(n int) string {
-	return fmt.Sprintf("00:00:00:00:00:%02d", n)
+	return fmt.Sprintf("00:00:00:00:00:%02x", n)
+}
+
+func validateHostCount(n int) error {
+	if n < 1 || n > 128 {
+		return fmt.Errorf("-hosts must be between 1 and 128 for the forwarding tables")
+	}
+	return nil
+}
+
+func multicastGroups(hosts int) []pre.MulticastGroup {
+	if hosts < 2 {
+		return nil
+	}
+	groups := make([]pre.MulticastGroup, 0, hosts)
+	for ingress := 1; ingress <= hosts; ingress++ {
+		replicas := make([]pre.Replica, 0, hosts-1)
+		for port := 1; port <= hosts; port++ {
+			if port != ingress {
+				replicas = append(replicas, pre.Replica{EgressPort: uint32(port), Instance: 0})
+			}
+		}
+		groups = append(groups, pre.MulticastGroup{ID: uint32(ingress), Replicas: replicas})
+	}
+	return groups
 }
 
 func main() {
@@ -37,6 +61,9 @@ func main() {
 		hosts  = flag.Int("hosts", 4, "number of hosts (= number of switch ports)")
 	)
 	flag.Parse()
+	if err := validateHostCount(*hosts); err != nil {
+		log.Fatal(err)
+	}
 	if *p4info == "" || *config == "" {
 		log.Fatal("-p4info and -config are required")
 	}
@@ -78,7 +105,7 @@ func main() {
 	}
 	log.Printf("pipeline installed via %s", res.Action)
 
-	// 1) Unicast dmac entries — same as case 03.
+	// Install each host's unicast destination and port.
 	for n := 1; n <= *hosts; n++ {
 		mac := macOfHost(n)
 		entry, err := tableentry.NewBuilder(p, "MyIngress.dmac").
@@ -95,37 +122,27 @@ func main() {
 		log.Printf("dmac %s -> port %d", mac, n)
 	}
 
-	// 2) Multicast groups. For each ingress port P, create group P that
-	//    replicates to every port EXCEPT P. Group IDs == ingress port
-	//    for simplicity.
+	// Each group sends one copy to every port except its ingress.
+	// A single-host topology has no recipients and needs no group.
 	preW, err := pre.NewWriter(c)
 	if err != nil {
 		log.Fatalf("pre writer: %v", err)
 	}
-	for ingress := 1; ingress <= *hosts; ingress++ {
-		replicas := make([]pre.Replica, 0, *hosts-1)
-		for p := 1; p <= *hosts; p++ {
-			if p == ingress {
-				continue
-			}
-			replicas = append(replicas, pre.Replica{EgressPort: uint32(p), Instance: 0})
+	groups := multicastGroups(*hosts)
+	for _, group := range groups {
+		if err := preW.InsertMulticastGroup(ctx, group); err != nil {
+			log.Fatalf("insert multicast group %d: %v", group.ID, err)
 		}
-		if err := preW.InsertMulticastGroup(ctx, pre.MulticastGroup{
-			ID:       uint32(ingress),
-			Replicas: replicas,
-		}); err != nil {
-			log.Fatalf("insert multicast group %d: %v", ingress, err)
-		}
-		log.Printf("multicast group %d = ports %v", ingress, replicaPorts(replicas))
+		log.Printf("multicast group %d = ports %v", group.ID, replicaPorts(group.Replicas))
 	}
 
-	// 3) select_mcast_grp entries — ingress port -> multicast group.
-	for ingress := 1; ingress <= *hosts; ingress++ {
+	// Select only installed groups by ingress port.
+	for _, group := range groups {
 		entry, err := tableentry.NewBuilder(p, "MyIngress.select_mcast_grp").
 			Match("standard_metadata.ingress_port",
-				tableentry.Exact(codec.MustEncodeUint(uint64(ingress), 9))).
+				tableentry.Exact(codec.MustEncodeUint(uint64(group.ID), 9))).
 			Action("MyIngress.set_mcast_grp",
-				tableentry.Param("mcast_grp", codec.MustEncodeUint(uint64(ingress), 16))).
+				tableentry.Param("mcast_grp", codec.MustEncodeUint(uint64(group.ID), 16))).
 			Build()
 		if err != nil {
 			log.Fatalf("build select_mcast_grp entry: %v", err)
@@ -133,11 +150,11 @@ func main() {
 		if err := c.WriteTableEntry(ctx, client.UpdateInsert, entry); err != nil {
 			log.Fatalf("insert select_mcast_grp: %v", err)
 		}
-		log.Printf("ingress_port %d -> mcast_grp %d", ingress, ingress)
+		log.Printf("ingress_port %d -> mcast_grp %d", group.ID, group.ID)
 	}
 
 	fmt.Printf("broadcast-switch ready: %d dmac entries, %d multicast groups\n",
-		*hosts, *hosts)
+		*hosts, len(groups))
 	<-ctx.Done()
 	log.Println("shutting down")
 }
